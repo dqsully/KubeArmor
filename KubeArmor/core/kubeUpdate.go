@@ -800,15 +800,16 @@ func (dm *KubeArmorDaemon) WatchK8sPods() {
 
 				dm.K8sPodsLock.Lock()
 
+				duplicateAdd := false
+
 				if event.Type == "ADDED" {
-					new := true
 					for _, k8spod := range dm.K8sPods {
 						if k8spod.Metadata["namespaceName"] == pod.Metadata["namespaceName"] && k8spod.Metadata["podName"] == pod.Metadata["podName"] {
-							new = false
+							duplicateAdd = true
 							break
 						}
 					}
-					if new {
+					if !duplicateAdd {
 						dm.K8sPods = append(dm.K8sPods, pod)
 					}
 				} else if event.Type == "MODIFIED" {
@@ -837,7 +838,11 @@ func (dm *KubeArmorDaemon) WatchK8sPods() {
 				}
 
 				// update a endpoint corresponding to the pod
-				dm.UpdateEndPointWithPod(event.Type, pod)
+				if duplicateAdd {
+					dm.UpdateEndPointWithPod("MODIFIED", pod)
+				} else {
+					dm.UpdateEndPointWithPod(event.Type, pod)
+				}
 			}
 		} else {
 			time.Sleep(time.Second * 1)
