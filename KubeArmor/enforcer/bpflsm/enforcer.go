@@ -317,6 +317,7 @@ func (be *BPFEnforcer) TraceEvents() {
 
 		case mon.FileOpen, mon.FilePermission, mon.FileMknod, mon.FileMkdir, mon.FileRmdir, mon.FileUnlink, mon.FileSymlink, mon.FileLink, mon.FileRename, mon.FileChmod, mon.FileTruncate:
 			log.Operation = "File"
+			log.Source = string(bytes.Trim(event.Data.Source[:], "\x00"))
 			log.Resource = string(bytes.Trim(event.Data.Path[:], "\x00"))
 			log.Data = "lsm=" + mon.GetSyscallName(int32(event.EventID))
 
