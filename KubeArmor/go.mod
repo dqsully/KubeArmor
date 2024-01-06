@@ -29,6 +29,7 @@ require (
 	github.com/cilium/cilium v1.13.2
 	github.com/cilium/ebpf v0.11.0
 	github.com/containerd/containerd v1.7.1
+	github.com/containerd/nri v0.5.0
 	github.com/containerd/typeurl/v2 v2.1.1
 	github.com/docker/docker v24.0.7+incompatible
 	github.com/golang/protobuf v1.5.3
