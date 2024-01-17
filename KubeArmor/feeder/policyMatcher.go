@@ -923,7 +923,6 @@ func setLogFields(log *tp.Log, existAllowPolicy bool, defaultPosture string, vis
 		(*log).Type = "HostLog"
 	}
 
-
 	// handles host visibility
 	// return true if visibility enabled
 	// return false otherwise so that log is skipped
@@ -1453,6 +1452,12 @@ func (fd *Feeder) UpdateMatchedPolicy(log tp.Log) tp.Log {
 				fd.DefaultPostures[log.NamespaceName] = globalDefaultPosture
 			}
 
+			if cfg.GlobalCfg.EnforceAllDefaultPolicy && (existFileAllowPolicy || existNetworkAllowPolicy || existCapabilitiesAllowPolicy) {
+				existFileAllowPolicy = true
+				existNetworkAllowPolicy = true
+				existCapabilitiesAllowPolicy = true
+			}
+
 			if log.Operation == "Process" {
 				if setLogFields(&log, existFileAllowPolicy, fd.DefaultPostures[log.NamespaceName].FileAction, log.ProcessVisibilityEnabled, true) {
 					return log
@@ -1484,6 +1489,12 @@ func (fd *Feeder) UpdateMatchedPolicy(log tp.Log) tp.Log {
 		}
 	} else { // host
 		if log.Type == "" {
+			if cfg.GlobalCfg.EnforceAllDefaultPolicy && (existFileAllowPolicy || existNetworkAllowPolicy || existCapabilitiesAllowPolicy) {
+				existFileAllowPolicy = true
+				existNetworkAllowPolicy = true
+				existCapabilitiesAllowPolicy = true
+			}
+
 			// host log
 			if log.Operation == "Process" {
 				if setLogFields(&log, existFileAllowPolicy, "allow", fd.Node.ProcessVisibilityEnabled, false) {

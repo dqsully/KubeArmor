@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/cilium/ebpf"
+	cfg "github.com/kubearmor/KubeArmor/KubeArmor/config"
 	tp "github.com/kubearmor/KubeArmor/KubeArmor/types"
 )
 
@@ -295,6 +296,13 @@ func (be *BPFEnforcer) UpdateContainerRules(id string, securityPolicies []tp.Sec
 		be.Logger.Printf("Deleting inner map for %s", id)
 		be.DeleteContainerInnerMap(id)
 		return
+	}
+
+	// Enforce all policies if at least one is enforced and enforceAllDefaultPolicy is true
+	if cfg.GlobalCfg.EnforceAllDefaultPolicy && (newrules.ProcWhiteListPosture || newrules.FileWhiteListPosture || newrules.NetWhiteListPosture) {
+		newrules.ProcWhiteListPosture = true
+		newrules.FileWhiteListPosture = true
+		newrules.NetWhiteListPosture = true
 	}
 
 	// Check for differences in Fresh Rules Set and Existing Ruleset
