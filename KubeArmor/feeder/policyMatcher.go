@@ -4,6 +4,7 @@
 package feeder
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -31,7 +32,7 @@ func GetProtocolFromName(proto string) string {
 	case "raw":
 		return "type=SOCK_RAW"
 	default:
-		return "unknown"
+		return fmt.Sprintf("unknown,protocol=%s", proto)
 	}
 }
 
