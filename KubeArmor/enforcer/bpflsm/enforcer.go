@@ -332,6 +332,7 @@ func (be *BPFEnforcer) TraceEvents() {
 			} else if event.Data.Path[0] == 3 {
 				log.Resource = fd.GetProtocolFromName(mon.GetProtocol(sockProtocol))
 			}
+			log.Source = string(bytes.Trim(event.Data.Source[:], "\x00"))
 			log.Data = "lsm=" + mon.GetSyscallName(int32(event.EventID)) + " " + log.Resource
 
 		case mon.SecurityBprmCheck:
