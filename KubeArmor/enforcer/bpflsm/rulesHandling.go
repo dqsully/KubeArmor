@@ -378,6 +378,8 @@ func (be *BPFEnforcer) UpdateContainerRules(id string, securityPolicies []tp.Sec
 		for _, net := range secPolicy.Spec.Network.MatchProtocols {
 			var val [2]uint8
 			var key = InnerKey{Path: [256]byte{}, Source: [256]byte{}}
+
+			// TODO: fix path generation
 			if val, ok := protocols[strings.ToLower(net.Protocol)]; ok {
 				key.Path[0] = PROTOCOL
 				key.Path[1] = val

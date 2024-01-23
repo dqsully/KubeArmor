@@ -313,18 +313,22 @@ func (be *BPFEnforcer) TraceEvents() {
 			},
 		})
 
+		source, _, _ := bytes.Cut(event.Data.Source[:], []byte{0})
+		path, _, _ := bytes.Cut(event.Data.Path[:], []byte{0})
+
 		switch event.EventID {
 
 		case mon.FileOpen, mon.FilePermission, mon.FileMknod, mon.FileMkdir, mon.FileRmdir, mon.FileUnlink, mon.FileSymlink, mon.FileLink, mon.FileRename, mon.FileChmod, mon.FileTruncate:
 			log.Operation = "File"
-			log.Source = string(bytes.Trim(event.Data.Source[:], "\x00"))
-			log.Resource = string(bytes.Trim(event.Data.Path[:], "\x00"))
+			log.Source = string(source)
+			log.Resource = string(path)
 			log.Data = "lsm=" + mon.GetSyscallName(int32(event.EventID))
 
 		case mon.SocketCreate, mon.SocketConnect, mon.SocketAccept:
 			var sockProtocol int32
 			sockProtocol = int32(event.Data.Path[1])
 			log.Operation = "Network"
+			// TODO: fix protocol parsing
 			if event.Data.Path[0] == 2 {
 				if event.Data.Path[1] == 3 {
 					log.Resource = fd.GetProtocolFromName("raw")
@@ -332,13 +336,13 @@ func (be *BPFEnforcer) TraceEvents() {
 			} else if event.Data.Path[0] == 3 {
 				log.Resource = fd.GetProtocolFromName(mon.GetProtocol(sockProtocol))
 			}
-			log.Source = string(bytes.Trim(event.Data.Source[:], "\x00"))
+			log.Source = string(source)
 			log.Data = "lsm=" + mon.GetSyscallName(int32(event.EventID)) + " " + log.Resource
 
 		case mon.SecurityBprmCheck:
 			log.Operation = "Process"
-			log.Source = string(bytes.Trim(event.Data.Source[:], "\x00"))
-			log.Resource = string(bytes.Trim(event.Data.Path[:], "\x00"))
+			log.Source = string(source)
+			log.Resource = string(path)
 			log.Data = "lsm=" + mon.GetSyscallName(int32(event.EventID))
 		}
 		if event.Retval >= 0 {
