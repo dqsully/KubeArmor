@@ -4,50 +4,37 @@
 #ifndef __SHARED_H
 #define __SHARED_H
 
+// This code targets Linux 5.8+, because that's the lowest version that supports
+// BPF ring buffers, which is how KubeArmor receives events from eBPF code.
+//
+// This means we have the following extra eBPF features available:
+// * BPF-to-BPF calls (not all functions need to be __always_inline)
+// * No instruction count limit
+// * Support for bounded loops
+//
+// However, we still have the following limitations:
+// * Max program complexity of 1M instructions
+// * Max stack size of 512 bytes, or 256 bytes for BPF-to-BPF calls
+// * Max stack depth of 8
+// * Max 5 arguments for a BPF-to-BPF call
+//
+// See https://github.com/iovisor/bcc/blob/master/docs/kernel-versions.md for
+// more info.
+
 #include "vmlinux.h"
 #include "vmlinux_macro.h"
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
+#include "syscalls.h"
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
+
 #define EPERM 13
 
-#define MAX_BUFFER_SIZE 32768 // 2 ** 15
-
-#define MAX_STRING_SIZE 256 // 2 ** 8
-
-#define PATH_BUFFER 0
-#define MAX_BUFFERS 1
-
-#define TASK_COMM_LEN 80
-
-#define AUDIT_POSTURE 140
-#define BLOCK_POSTURE 141
-
-enum file_hook_type { dpath = 0, dfileread, dfilewrite };
-
-enum deny_by_default {
-  dproc = 101,
-  dfile,
-  dnet
-}; // check if the list is whitelist/blacklist
-
-#define NET_MATCH 2
-
-typedef struct buffers {
-  char buf[MAX_BUFFER_SIZE];
-} bufs_t;
-
-typedef struct bufkey {
-  char path[MAX_STRING_SIZE];
-  char source[MAX_STRING_SIZE];
-} bufs_k;
-
-struct sockinfo {
-  char type;
-  char proto;
-};
+#define MASK_WRITE 0x00000002
+#define MASK_READ 0x00000004
+#define MASK_APPEND 0x00000008
 
 #undef container_of
 #define container_of(ptr, type, member)                                        \
@@ -55,94 +42,272 @@ struct sockinfo {
     const typeof(((type *)0)->member) *__mptr = (ptr);                         \
     (type *)((char *)__mptr - offsetof(type, member));                         \
   })
-struct {
-  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-  __type(key, u32);
-  __type(value, bufs_t);
-  __uint(max_entries, MAX_BUFFERS);
-} bufs SEC(".maps");
 
-struct {
-  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-  __type(key, u32);
-  __type(value, u32);
-  __uint(max_entries, MAX_BUFFERS);
-} bufs_off SEC(".maps");
+#define RULE_KEY_STR_LEN 256
 
-struct {
-  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-  __type(key, u32);
-  __type(value, bufs_k);
-  __uint(max_entries, 4);
-} bufk SEC(".maps");
+#define RULE_TYPE_FILE 1
+#define RULE_TYPE_PROCESS 2
+#define RULE_TYPE_NETWORK 3
 
+// Generic rule bitwise offsets
+#define RULE_OFFSET__BY_OWNER 4 // _BY_OWNER offsets should always be +4 from the more-generic offset
+
+// Path rule bitwise offsets
+#define RULE_OFFSET_FILE_READ 0
+#define RULE_OFFSET_FILE_READ_BY_OWNER 4
+#define RULE_OFFSET_FILE_WRITE 8
+#define RULE_OFFSET_FILE_WRITE_BY_OWNER 12
+#define RULE_OFFSET_PROCESS_EXECUTE 16
+#define RULE_OFFSET_PROCESS_EXECUTE_BY_OWNER 20
+
+// Network rule bitwise offsets (only one kind of network rule possible right
+// now)
+#define RULE_OFFSET_NETWORK 0
+
+// Default posture rule offsets
+#define RULE_OFFSET_DEFAULT_FILE 0
+#define RULE_OFFSET_DEFAULT_PROCESS 4
+#define RULE_OFFSET_DEFAULT_NETWORK 8
+
+// Bit flags for a 4-bit rule
+#define RULE_FLAG_ALLOW 1     // Allow event
+#define RULE_FLAG_LOG 2       // Log event to KubeArmor
+#define RULE_FLAG_RECURSIVE 4 // (for path rules ending in '/' only) Apply to all files under the directory
+#define RULE_FLAG_HINT 8      // (for path rules only) Indicates that there are more-specific directory rules under this directory
+
+#define RULE_MASK 0xF // A rule is 4 bits
+#define RULE_MASK_ANY(flag) (flag | (flag << 4) | (flag << 8) | (flag << 12) | (flag << 16) | (flag << 20) | (flag << 24) | (flag << 28)) // For a 32-bit value containing up to 8 rules, create a number with a given 4-bit mask repeated 8 times
+#define RULE_MASK_ANY_RECURSIVE (RULE_MASK_ANY(RULE_FLAG_RECURSIVE)) // 0x44444444, for checking if any of the 8 rules are recursive
+#define RULE_MASK_ANY_HINT (RULE_MASK_ANY(RULE_FLAG_HINT)) // 0x88888888, for checking if any of the 8 rules have deeper dir rules
+
+#define RULE_MASK__BY_OWNER (RULE_MASK << RULE_OFFSET_FILE_READ_BY_OWNER) // 0x000000F0, for checking a relative by-owner rule
+#define RULE_MASK_FILE_WRITE_ANY ((RULE_MASK << RULE_OFFSET_FILE_WRITE) | (RULE_MASK << RULE_OFFSET_FILE_WRITE_BY_OWNER)) // 0x0000FF00, for checking any file write rule
+
+// Helpful shortcuts for rule flags
+#define RULE_NONE 0                                  // No rule defined
+#define RULE_ALLOW (RULE_FLAG_ALLOW)                 // Allow event without logging
+#define RULE_BLOCK (RULE_FLAG_LOG)                   // Deny event and log
+#define RULE_AUDIT (RULE_FLAG_LOG | RULE_FLAG_ALLOW) // Allow event and log (aka Audit)
+
+// struct outer_key is the key type for the root BPF map, identifying a single
+// container by its pid and mount namespace IDs.
 struct outer_key {
   u32 pid_ns;
   u32 mnt_ns;
 };
 
+// kubearmor_containers is an eBPF map of maps. Only 1 level of map nesting is
+// allowed, so the top-level keyspace identifies each container, and the
+// second-level keyspace identifies enforcement rules by path/protocol and
+// source executable.
+//
+// Surprisingly, the inner map spec can't be defined here in C, only in the code
+// which sets up this eBPF program during runtime. (see
+// ../enforcer/bpflsm/enforcer.go)
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH_OF_MAPS);
+  __uint(max_entries, 256);
+  __uint(key_size, sizeof(struct outer_key));
+  __uint(value_size, sizeof(u32));
+  __uint(pinning, LIBBPF_PIN_BY_NAME);
+} kubearmor_containers SEC(".maps");
+
+struct network_rule_key {
+  union {
+    // Network rules apply by protocol/socket type, there's no path involved. So
+    // this union lets us commandeer the first 3 bytes of the path field to
+    // instead store the relevant network info. rule_type MUST be the first
+    // field, and it CANNOT be 47 (0x2F or the '/' character) because every path
+    // rule is going to start with that and we can't have any possible collisions.
+    struct {
+      // The non-path rule type, currently only network rules are supported in
+      // keys.
+      char rule_type;
+
+      // The socket type number (e.g. SOCK_STREAM, SOCK_DGRAM, etc.)
+      char socket_type;
+
+      // The IP protocol number (e.g. IPPROTO_TCP, IPPROTO_UDP, etc.)
+      char protocol;
+
+      // Empty struct field to make sure there's a null terminator at the end.
+      //
+      // Even though in normal C we could assume this byte was already zeroed,
+      // eBPF won't let us read this 4th byte until we write to it first, so we
+      // still need to zero it out ourselves at some point.
+      char null_byte;
+    };
+    char raw[4];
+  };
+};
+
+// rule_key is the key type for the inner maps of kubearmor_containers.
+//
+// 512 bytes
+struct rule_key {
+  // The path to the target file (being executed, read, written, etc.)
+  char path[RULE_KEY_STR_LEN];
+
+  // The path to the executable which took the action
+  char source[RULE_KEY_STR_LEN];
+};
+
+#define RULE_KEY_ID_ZERO 0      // This rule key is always left zeroed-out
+#define RULE_KEY_ID_GP 1        // General-purpose rule key, used for exact matches or as a match template for recursive rules
+#define RULE_KEY_ID_SCRATCH_1 2 // Scratch rule key, can be used by functions for temporary storage
+#define NUM_RULE_KEYS 3         // Number of rule key slots
+
+// rule_keys is a per-CPU array of rule_key structs for use during rule
+// enforcement.
+//
+// eBPF programs have a max stack frame size of 512 bytes, and a single struct
+// rule_key would consume all of that, so we have to store them in off-stack
+// memory instead.
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __type(key, u32);
+  __type(value, struct rule_key);
+  __uint(max_entries, NUM_RULE_KEYS);
+} rule_keys SEC(".maps");
+
+#define BUFFER_LEN 32760        // 2^15 - 8 or just under 32KiB, leaving space for 2 32-bit offsets
+#define BUFFER_HALF_POINT 16384 // 2^14, used for bounds checking
+#define BUFFER_HALF_MASK 16383  // 2^14 - 1, used for bounds checking
+
+#define BUFFER_ID_PATH 0 // Path buffer
+#define NUM_BUFFERS 1    // Number of buffers
+
+// buffer is exactly 32KiB, with strings written from the center towards either
+// end of the buffer (useful for constructing paths from the filename to the
+// root, and for proving eBPF validity with fewer required states).
+//
+// In eBPF, map values must be powers of 2 in size. There's no reason we need to
+// store our offsets in a separate map, so we just shrink the buffer by 8 bytes
+// and store 2 32-bit offsets at the end of the buffer instead.
+struct buffer {
+  char data[BUFFER_LEN];
+  u32 prepend_offset;
+  u32 append_offset;
+};
+
+// buffers is a per-CPU array of general-purpose buffers, especially useful for
+// concatenating strings.
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __type(key, u32);
+  __type(value, struct buffer);
+  __uint(max_entries, NUM_BUFFERS);
+} buffers SEC(".maps");
+
+// Bit flags for reporting events
+#define EVENT_FLAG_OWNER 1
+#define EVENT_FLAG_WRITE 2
+
+// event contains all audit info for an audited or blocked event
+//
+// Note: eBPF ring buffer values can be any length, so this struct doesn't need
+// to be a power of 2.
 struct event {
+  // Timestamp in nanoseconds
   u64 ts;
 
+  // PID and mount namespace IDs, for identifying the container
   u32 pid_id;
   u32 mnt_id;
 
+  // Host parent PID and PID
   u32 host_ppid;
   u32 host_pid;
 
+  // In-container parent PID, PID, and user ID
+  //
+  // If the parent process is not inside the same container, its PID will match
+  // whatever PID it has in its namespace. For example, if the parent process is
+  // in the host PID namespace, then ppid will match host_ppid.
   u32 ppid;
   u32 pid;
   u32 uid;
 
+  // The eBPF event matched, and its return value
   u32 event_id;
   s64 retval;
 
+  // Linux's recorded commandline
   u8 comm[TASK_COMM_LEN];
 
-  bufs_k data;
+  // Rule key and flags used to match the rule for this event
+  //
+  // KubeArmor understands that opening a file at /foo/bar/baz would match a
+  // recursive rule at /foo/, so we don't need to tell it exactly what key
+  // matched. However, we do need to tell it all the original data we used to
+  // make a match.
+  struct rule_key data;
+  u32 flags;
 };
 
+// Ring buffer for reporting events back to KubeArmor
 struct {
   __uint(type, BPF_MAP_TYPE_RINGBUF);
   __uint(max_entries, 1 << 24);
   __uint(pinning, LIBBPF_PIN_BY_NAME);
 } kubearmor_events SEC(".maps");
 
-#define RULE_EXEC 1 << 0
-#define RULE_WRITE 1 << 1
-#define RULE_READ 1 << 2
-#define RULE_OWNER 1 << 3
-#define RULE_DIR 1 << 4
-#define RULE_RECURSIVE 1 << 5
-#define RULE_HINT 1 << 6
-#define RULE_DENY 1 << 7
+// clear_buffer() resets the offset of a buffer to the midpoint, as if nothing
+// was ever written to it. This does not clear any data already inside the
+// buffer however except for writing a null byte at the midpoint.
+static __always_inline void clear_buffer(int buf_idx) {
+  struct buffer *buf = bpf_map_lookup_elem(&buffers, &buf_idx);
 
-#define MASK_WRITE 0x00000002
-#define MASK_READ 0x00000004
-#define MASK_APPEND 0x00000008
+  if (buf != NULL) {
+    buf->prepend_offset = BUFFER_HALF_POINT;
+    buf->append_offset = BUFFER_HALF_POINT;
+    buf->data[BUFFER_HALF_POINT] = '\0';
+  }
+}
 
-struct data_t {
-  union {
-    struct {
-      u8 processmask;
-      u8 filemask;
-    };
-    u8 mask[2];
-  };
-};
+// get_task_pid_ns_id() returns the Linux PID namespace for a given task.
+static __always_inline u32 get_task_pid_ns_id(struct task_struct *task) {
+  return BPF_CORE_READ(task, nsproxy, pid_ns_for_children, ns).inum;
+}
 
-struct outer_hash {
-  __uint(type, BPF_MAP_TYPE_HASH_OF_MAPS);
-  __uint(max_entries, 256);
-  __uint(key_size, sizeof(struct outer_key));
-  __uint(value_size, sizeof(u32));
-  __uint(pinning, LIBBPF_PIN_BY_NAME);
-};
+// get_task_mnt_ns_id() returns the Linux mount namespace for a given task.
+static __always_inline u32 get_task_mnt_ns_id(struct task_struct *task) {
+  return BPF_CORE_READ(task, nsproxy, mnt_ns, ns).inum;
+}
 
-struct outer_hash kubearmor_containers SEC(".maps");
+// get_task_pid_vnr() returns the in-namespace PID for a given task.
+static __always_inline u32 get_task_pid_vnr(struct task_struct *task) {
+  struct pid *pid = BPF_CORE_READ(task, thread_pid);
+  unsigned int level = BPF_CORE_READ(pid, level);
+  return BPF_CORE_READ(pid, numbers[level].nr);
+}
 
-static __always_inline bufs_t *get_buf(int idx) {
-  return bpf_map_lookup_elem(&bufs, &idx);
+// get_task_ns_ppid() returns the in-namespace parent PID for a given task.
+static __always_inline u32 get_task_ns_ppid(struct task_struct *task) {
+  struct task_struct *real_parent = BPF_CORE_READ(task, real_parent);
+  return get_task_pid_vnr(real_parent);
+}
+
+// get_task_ns_tgid() returns the in-namespace PID for a given task's main
+// thread.
+//
+// In Linux, threads are given their own PIDs, and a task may be a thread, but
+// the threads are all grouped under the main thread of the process.
+// task->group_leader is that main thread of the process, so we can use it to
+// get the in-namespace PID for the process.
+static __always_inline u32 get_task_ns_tgid(struct task_struct *task) {
+  struct task_struct *group_leader = BPF_CORE_READ(task, group_leader);
+  return get_task_pid_vnr(group_leader);
+}
+
+// get_task_ppid() returns the task's parent PID.
+static __always_inline u32 get_task_ppid(struct task_struct *task) {
+  return BPF_CORE_READ(task, parent, pid);
+}
+
+// get_task_file() returns the task's executable file.
+static __always_inline struct file *get_task_file(struct task_struct *task) {
+  return BPF_CORE_READ(task, mm, exe_file);
 }
 
 // real_mount() returns the `struct mount` that contains the given `struct
@@ -151,49 +316,45 @@ static __always_inline struct mount *real_mount(struct vfsmount *mnt) {
   return container_of(mnt, struct mount, mnt);
 }
 
-// init_buffer() resets the offset of the buffer to the end, as if nothing was
-// ever written to it. This does not clear any data already inside the buffer
-// however.
-static __always_inline void init_buffer(int buf_idx) {
-  int new_offset = MAX_BUFFER_SIZE;
-  bpf_map_update_elem(&bufs_off, &buf_idx, &new_offset, BPF_ANY);
-}
-
 // prepend_path() writes out the string representation of a path to the given
-// buffer, starting from the end and working backwards.
-//
-// TODO: add max_len parameter?
-static __always_inline char *prepend_path(struct path *path, int buf_idx) {
+// buffer.
+static char *prepend_path(struct path *path, int buf_idx) {
   if (path == NULL) {
     return NULL;
   }
 
-  char slash = '/';
-  char null = '\0';
-
   // Load the buffer to write into (per CPU)
-  int *buf_offset = bpf_map_lookup_elem(&bufs_off, &buf_idx);
-  bufs_t *string_p = get_buf(buf_idx);
-
-  if (buf_offset == NULL || string_p == NULL) {
+  struct buffer *buf = bpf_map_lookup_elem(&buffers, &buf_idx);
+  if (buf == NULL) {
     return NULL;
   }
 
-  int offset = *buf_offset;
+  // This needs to be a variable so that the eBPF verifier can track its state
+  s32 old_offset = buf->prepend_offset;
+
+  // If the buffer is full, we can't write anything to it.
+  if (old_offset < 1) {
+    return NULL;
+  }
+
+  // To please the eBPF verifier, cap old_offset at BUFFER_HALF_POINT as a
+  // bounds check.
+  if (old_offset > BUFFER_HALF_POINT) {
+    old_offset = BUFFER_HALF_POINT;
+  }
+
+  s32 new_offset = old_offset;
+  u32 d_len;
 
   struct dentry *dentry = path->dentry;
-  struct vfsmount *vfsmnt = path->mnt;
 
-  struct mount *mnt = real_mount(vfsmnt);
-  struct dentry *mnt_root = BPF_CORE_READ(vfsmnt, mnt_root);
+  struct mount *mnt = real_mount(path->mnt);
+  struct dentry *mnt_root = BPF_CORE_READ(&mnt->mnt, mnt_root);
 
   struct dentry *parent;
   struct mount *m;
   struct qstr d_name;
 
-  // This loop doesn't need to be unrolled since Linux 5.3, and it reduces the
-  // program size dramatically by not unrolling it (until Linux 5.8, programs
-  // were limited to 4096 instructions)
   for (int i = 0; i < 30; i++) {
     // Grab the current dentry's parent
     parent = BPF_CORE_READ(dentry, d_parent);
@@ -210,9 +371,13 @@ static __always_inline char *prepend_path(struct path *path, int buf_idx) {
       // Otherwise, grab the dentry where this mount was mounted to its parent,
       // grab the parent mount, get the root dentry of that mount, and continue
       dentry = BPF_CORE_READ(mnt, mnt_mountpoint);
-      mnt = BPF_CORE_READ(mnt, mnt_parent);
-      vfsmnt = &mnt->mnt;
-      mnt_root = BPF_CORE_READ(vfsmnt, mnt_root);
+      mnt = m;
+      mnt_root = BPF_CORE_READ(&mnt->mnt, mnt_root);
+      parent = BPF_CORE_READ(dentry, d_parent);
+
+      // This continue is kinda funky being here, but it makes the complexity of
+      // this loop go from O(n^>2) to O(n^<1) in testing. I couldn't tell you
+      // why... but it makes a huge difference.
       continue;
     }
 
@@ -224,31 +389,53 @@ static __always_inline char *prepend_path(struct path *path, int buf_idx) {
     // Get the dentry's static name (string with length and hash)
     d_name = BPF_CORE_READ(dentry, d_name);
 
-    // Rewind in the buffer to where the start of the name can go
-    offset -= (d_name.len + 1);
+    // This is really only required for the eBPF verifier, since d_name.len
+    // won't ever be >255 for a dentry.
+    d_len = d_name.len & BUFFER_HALF_MASK;
 
-    // If we rewound to before the buffer's start, that's a fatal error
-    if (offset < 0)
+    // Rewind in the buffer to where the start of the name can go
+    new_offset -= (d_len + 1);
+
+    // If we rewound to the buffer's start, that's a fatal error (since we need
+    // to prepend a slash at the start of the path still)
+    if (new_offset < 1) {
       return NULL;
+    }
 
     // Copy the d_name into the buffer at offset
+    //
+    // There is a HUGE hack here to please the eBPF verifier. Even though d_len
+    // will only be between 0 and 255, if we let the verifier know that, it will
+    // track every possible maximum offset written to the buffer and returned.
+    // Instead, we tell the verifier that d_len is up to 50% of the buffer's
+    // size, which in the following function call, means (to the verifier) that:
+    //
+    // * new_offset may be anywhere from 1 to 16383
+    // * d_len may be anywhere from 0 to 16383
+    //
+    // -- therefore --
+    //
+    // * bpf_probe_read_str could access anywhere from 1 to 32767 within the
+    //   buffer (the verifier can't track the relationship between new_offset
+    //   and d_len, just their individual bounds)
+    // * the returned pointer could be anywhere from 0 to 16383 within the
+    //   buffer or NULL, *regardless of how many times this loop was executed*
+    //
+    // When tested with the loop running only 5 times, this hack reduced the
+    // instruction complexity by 75%.
     int sz = bpf_probe_read_str(
-      &(string_p->buf[(offset)]),
-      (d_name.len + 1),
+      &(buf->data[new_offset]),
+      (d_len + 1),
       d_name.name
     );
 
     if (sz > 1) {
       // If we wrote more than one character, write a slash after the path
       // segment (instead of the null terminator)
-      bpf_probe_read(
-        &(string_p->buf[(offset + d_name.len)]),
-        1,
-        &slash
-      );
+      buf->data[new_offset + d_len] = '/';
     } else {
       // Otherwise, if the dentry had no name, pretend it didn't exist
-      offset += (d_name.len + 1);
+      new_offset += (d_len + 1);
     }
 
     // Check the parent on the next iteration
@@ -256,220 +443,184 @@ static __always_inline char *prepend_path(struct path *path, int buf_idx) {
   }
 
   // Return NULL if we didn't write any paths into the buffer
-  if (offset == *buf_offset) {
+  if (new_offset == old_offset) {
     return NULL;
   }
 
   // Write a null terminator at the end of the path so we have a null-terminated
   // string again
-  bpf_probe_read(&(string_p->buf[*buf_offset - 1]), 1, &null);
+  buf->data[old_offset - 1] = '\0';
 
   // Add a slash to the beginning of the path
-  offset--;
-  bpf_probe_read(&(string_p->buf[offset]), 1, &slash);
+  new_offset--;
+  buf->data[new_offset] = '/';
 
   // Save the new buffer offset back into the map
-  *buf_offset = offset;
+  buf->prepend_offset = new_offset;
 
   // Return a pointer to the start of our new null-terminated path string
-  return &string_p->buf[offset];
-}
+  return &buf->data[new_offset];
+};
 
-static __always_inline u32 get_task_pid_ns_id(struct task_struct *task) {
-  return BPF_CORE_READ(task, nsproxy, pid_ns_for_children, ns).inum;
-}
-
-static __always_inline u32 get_task_mnt_ns_id(struct task_struct *task) {
-  return BPF_CORE_READ(task, nsproxy, mnt_ns, ns).inum;
-}
-
-static __always_inline u32 get_task_pid_vnr(struct task_struct *task) {
-  struct pid *pid = BPF_CORE_READ(task, thread_pid);
-  unsigned int level = BPF_CORE_READ(pid, level);
-  return BPF_CORE_READ(pid, numbers[level].nr);
-}
-
-static __always_inline u32 get_task_ns_ppid(struct task_struct *task) {
-  struct task_struct *real_parent = BPF_CORE_READ(task, real_parent);
-  return get_task_pid_vnr(real_parent);
-}
-
-static __always_inline u32 get_task_ns_tgid(struct task_struct *task) {
-  struct task_struct *group_leader = BPF_CORE_READ(task, group_leader);
-  return get_task_pid_vnr(group_leader);
-}
-
-static __always_inline u32 get_task_ppid(struct task_struct *task) {
-  return BPF_CORE_READ(task, parent, pid);
-}
-
-static __always_inline struct file *get_task_file(struct task_struct *task) {
-  return BPF_CORE_READ(task, mm, exe_file);
-}
-
-static __always_inline void get_outer_key(
-  struct outer_key *key,
-  struct task_struct *t
+static __always_inline u32 init_event(
+  struct event *event,
+  struct task_struct *task
 ) {
-  key->pid_ns = get_task_pid_ns_id(t);
-  key->mnt_ns = get_task_mnt_ns_id(t);
+  event->ts = bpf_ktime_get_ns();
 
-  if (key->pid_ns == PROC_PID_INIT_INO) {
-    key->pid_ns = 0;
-    key->mnt_ns = 0;
+  event->host_ppid = get_task_ppid(task);
+  event->host_pid = bpf_get_current_pid_tgid() >> 32;
+
+  u32 pid = get_task_ns_tgid(task);
+  if (event->host_pid == pid) {
+    // host
+    event->pid_id = 0;
+    event->mnt_id = 0;
+
+    event->ppid = get_task_ppid(task);
+    event->pid = bpf_get_current_pid_tgid() >> 32;
+  } else {
+    // container
+    event->pid_id = get_task_pid_ns_id(task);
+    event->mnt_id = get_task_mnt_ns_id(task);
+
+    event->ppid = get_task_ns_ppid(task);
+    event->pid = pid;
   }
+
+  event->uid = bpf_get_current_uid_gid();
+
+  bpf_get_current_comm(&event->comm, sizeof(event->comm));
+
+  return 0;
+}
+
+// TODO: optimize for instruction complexity?
+static u32 match_dir(
+  void *inner,
+  char *path,
+  struct rule_key *in_key,
+  int working_key_idx,
+  u32 mask
+) {
+  // Inner key used for checking against inner map
+  struct rule_key *key = bpf_map_lookup_elem(&rule_keys, &working_key_idx);
+  if (key == NULL) {
+    return RULE_NONE;
+  }
+
+  u32 *recursive_rule = NULL;
+  u32 *dir_rule = NULL;
+
+  // Check for recursive and non-recursive directory matches
+  //
+  // Every directory rule ends with a '/' character. And then for any deeper
+  // directory rule like /foo/bar/baz/ (recursive or not), there will be 'hint'
+  // policies created at /foo/bar/, /foo/, and / so that we know there's more to
+  // look for.
+  //
+  // If we pass a recursive directory rule at /foo/, we want to save it until we
+  // find a more-specific rule, if any. And if we get all the way to
+  // /foo/bar/baz/ (for some file /foo/bar/baz/file.txt) and find a rule there,
+  // recursive or not, it will always take priority. The most-recent rule read
+  // gets stored into dir_rule, so by the end of the loop if dir_rule isn't
+  // NULL, it's the most-specific rule and will take priority. If /foo/bar/ is
+  // as far as the policies go, then /foo/bar/baz/ will be NULL and any
+  // previously-saved recursive rule will apply instead.
+  //
+  // TODO: fix the cyclic complexity in this loop
+  for (int i = 0; i < RULE_KEY_STR_LEN - 1; i++) {
+    // If we've reached the end of the string, break
+    if (path[i] == '\0') {
+      break;
+    }
+
+    // We only care about '/' characters, matching entire directories, so skip
+    // until we find one
+    if (path[i] != '/') {
+      continue;
+    }
+
+    // Copy from input key into working key, and set its path to the
+    // directory we're about to check for
+    bpf_map_update_elem(&rule_keys, &working_key_idx, in_key, BPF_ANY);
+    bpf_probe_read_str(key->path, i + 2, path);
+
+    // Check the inner map for a matching rule, and stop looking if we couldn't
+    // find one
+    dir_rule = bpf_map_lookup_elem(inner, key);
+    if (dir_rule == NULL) {
+      // If we get here, it means there's no non-recursive directory rule that
+      // applies, because there was still more path to parse but the policies
+      // didn't go quite as deep.
+      break;
+    }
+
+    // Check if the rule is a process rule with a recursive directory match
+    if (*dir_rule & mask & RULE_MASK_ANY_RECURSIVE) {
+      if (*dir_rule & mask & RULE_MASK_ANY_HINT) {
+        // There are more-specific policies within this directory, so save the
+        // current directory rule as the most-specific recursive rule so far
+        recursive_rule = dir_rule;
+      } else {
+        // There are no more-specific policies within this directory, so return
+        // the current directory rule
+        return *dir_rule;
+      }
+    }
+  }
+
+  // If last directory in the path matched a rule, return that since it's the
+  // most specific rule possible. This is for both recursive and non-recursive
+  // policies.
+  if (dir_rule != NULL && (*dir_rule & mask)) {
+    return *dir_rule;
+  }
+
+  // Otherwise, return the most-recent recursive rule we found along the way, if
+  // any
+  if (recursive_rule != NULL) {
+    return *recursive_rule;
+  }
+
+  return RULE_NONE;
+}
+
+// get_outer_key() returns the outer_key for the given task.
+static __always_inline struct outer_key get_outer_key(struct task_struct *t) {
+  struct outer_key key = {
+    .pid_ns = get_task_pid_ns_id(t),
+    .mnt_ns = get_task_mnt_ns_id(t),
+  };
+
+  if (key.pid_ns == PROC_PID_INIT_INO) {
+    key.pid_ns = 0;
+    key.mnt_ns = 0;
+  }
+
+  return key;
 }
 
 // get_task_source() returns a pointer to a null-terminated string containing
 // the full path of the source binary of the given task, or NULL if no
 // executable was found.
-//
-// This string is constructed and stored in the PATH_BUFFER buffer, which will
-// not be overwritten until a call to init_buffer(PATH_BUFFER) is made.
-static __always_inline char *get_task_source(struct task_struct *t) {
+static __always_inline char *get_task_source(
+  struct task_struct *t,
+  int buffer_id
+) {
   struct file *file_p = get_task_file(t);
-  if (file_p == NULL)
+  if (file_p == NULL) {
     return NULL;
-
-  struct path f_src = BPF_CORE_READ(file_p, f_path);
-
-  return prepend_path(&f_src, PATH_BUFFER);
-}
-
-static __always_inline struct data_t *match_dir(
-  void *inner,
-  char path[256],
-  int in_buf_idx,
-  int working_buf_idx,
-  u8 mask,
-  bool match_type
-) {
-    // Inner key used for checking against inner map
-    bufs_k *key = bpf_map_lookup_elem(&bufk, &working_buf_idx);
-    if (key == NULL) {
-      return NULL;
-    }
-
-    struct data_t *recursive_policy = NULL;
-    struct data_t *dir_policy = NULL;
-
-    u8 dir_mask;
-
-    // Check for recursive and non-recursive directory matches
-    //
-    // Every directory policy ends with a '/' character. And then for any deeper
-    // directory policy like /foo/bar/baz/ (recursive or not), there will be
-    // 'hint' policies created at /foo/bar/, /foo/, and / so that we know
-    // there's more to look for.
-    //
-    // If we pass a recursive directory policy at /foo/, we want to save it
-    // until we find a more-specific policy, if any. And if we get all the way
-    // to /foo/bar/baz/ (for some file /foo/bar/baz/file.txt) and find a policy
-    // there, recursive or not, it will always take priority. The most-recent
-    // policy read gets stored into dir_policy, so by the end of the loop if
-    // dir_policy isn't NULL, it's the most-specific policy and will take
-    // priority. If /foo/bar/ is as far as the policies go, then /foo/bar/baz/
-    // will be NULL and any previously-saved recursive policy will apply
-    // instead.
-    for (int i = 0; i < MAX_STRING_SIZE - 1; i++) {
-      // If we've reached the end of the string, break
-      if (path[i] == '\0') {
-        break;
-      }
-
-      // We only care about '/' characters, matching entire directories, so skip
-      // until we find one
-      if (path[i] != '/') {
-        continue;
-      }
-
-      // Copy from input buffer into working buffer, and set its path to the
-      // directory we're about to check for
-      bpf_map_update_elem(&bufk, &working_buf_idx, &in_buf_idx, BPF_ANY);
-      bpf_probe_read_str(key->path, i + 2, path);
-
-      // Check the inner map for a matching policy, and stop looking if we
-      // couldn't find one
-      dir_policy = bpf_map_lookup_elem(inner, key);
-      if (dir_policy == NULL) {
-        // If we get here, it means there's no non-recursive directory policy
-        // that applies, because there was still more path to parse but the
-        // policies didn't go quite as deep.
-        break;
-      }
-
-      // Check if the policy is a process policy with a recursive directory
-      // match
-      dir_mask = mask | RULE_DIR | RULE_RECURSIVE;
-      if ((dir_policy->mask[match_type] & dir_mask) == dir_mask) {
-        if (dir_policy->mask[match_type] & RULE_HINT) {
-          // There are more-specific policies within this directory, so save the
-          // current directory policy as the most-specific recursive policy so
-          // far
-          recursive_policy = dir_policy;
-        } else {
-          // There are no more-specific policies within this directory, so
-          // return the current directory policy
-          return dir_policy;
-        }
-      }
-    }
-
-    // If last directory in the path matched a non-recursive policy, return that
-    // since it's the most specific policy possible. This is for both recursive
-    // and non-recursive policies.
-    dir_mask = mask | RULE_DIR;
-    if (dir_policy != NULL &&
-        (dir_policy->mask[match_type] & dir_mask) == dir_mask) {
-      return dir_policy;
-    }
-
-    // Otherwise, return the most-recent recursive policy we found along the
-    // way, if any
-    return recursive_policy;
-}
-
-// == Context Management == //
-
-static __always_inline u32 init_context(
-  struct event *event_data,
-  struct task_struct *task
-) {
-  event_data->ts = bpf_ktime_get_ns();
-
-  event_data->host_ppid = get_task_ppid(task);
-  event_data->host_pid = bpf_get_current_pid_tgid() >> 32;
-
-  u32 pid = get_task_ns_tgid(task);
-  if (event_data->host_pid == pid) { // host
-    event_data->pid_id = 0;
-    event_data->mnt_id = 0;
-
-    event_data->ppid = get_task_ppid(task);
-    event_data->pid = bpf_get_current_pid_tgid() >> 32;
-  } else { // container
-    event_data->pid_id = get_task_pid_ns_id(task);
-    event_data->mnt_id = get_task_mnt_ns_id(task);
-
-    event_data->ppid = get_task_ns_ppid(task);
-    event_data->pid = pid;
   }
 
-  event_data->uid = bpf_get_current_uid_gid();
+  // TODO: fix process path detection when exe_file is NULL (dynamic filesystem)
+  struct path f_src = BPF_CORE_READ(file_p, f_path);
 
-  bpf_get_current_comm(&event_data->comm, sizeof(event_data->comm));
-
-  return 0;
+  return prepend_path(&f_src, buffer_id);
 }
 
-static __always_inline bool is_owner(struct file *file_p) {
-  kuid_t owner = BPF_CORE_READ(file_p, f_inode, i_uid);
-  unsigned int z = bpf_get_current_uid_gid();
-  if (owner.val != z)
-    return false;
-  return true;
-}
-
+// is_owner_path() returns true if the given dentry is owned by the current
+// process's Linux user.
 static __always_inline bool is_owner_path(struct dentry *dent) {
   kuid_t owner = BPF_CORE_READ(dent, d_inode, i_uid);
   unsigned int z = bpf_get_current_uid_gid();
@@ -478,189 +629,248 @@ static __always_inline bool is_owner_path(struct dentry *dent) {
   return true;
 }
 
+// apply_rule() determines the return value for a given event, and submits it to
+// the KubeArmor ring buffer if necessary. If the provided rule is RULE_NONE, it
+// will also check the default rule for the given rule type.
+static __always_inline int apply_rule(
+  u32 *inner,
+  struct task_struct *task,
+  char *path,
+  char *source,
+  u32 event_id,
+  u32 flags,
+  u32 rule,
+  u32 rule_type
+) {
+  // If there wasn't a matched rule, look up the default rule
+  if (rule == RULE_NONE) {
+    u32 zero_idx = RULE_KEY_ID_ZERO;
+    struct rule_key *zero_key = bpf_map_lookup_elem(&rule_keys, &zero_idx);
+    if (zero_key != NULL) {
+      u32 *default_rule = bpf_map_lookup_elem(inner, zero_key);
+      if (default_rule != NULL) {
+        // If there is a default rule set, get the lowest 2 bits for the rule type
+        rule = (*default_rule >> ((rule_type - 1) * 4)) & 3;
+      }
+    }
+  }
+
+  // If there is no default rule or the rule is an allow rule, return ok and
+  // don't log the event to KubeArmor
+  if (rule < RULE_BLOCK) {
+    return 0;
+  }
+
+  // This needs to be a variable, since we can't access alert->retval after
+  // submitting it to the ring buffer.
+  int retval;
+
+  // Figure out what the return value should be
+  if (rule == RULE_BLOCK) {
+    retval = -EPERM;
+  } else {
+    retval = 0;
+  }
+
+  // Reserve space on the output ring buffer for whatever event we're logging
+  struct event *alert = bpf_ringbuf_reserve(
+    &kubearmor_events,
+    sizeof(struct event),
+    0
+  );
+  if (alert == NULL) {
+    // We couldn't reserve space on the ring buffer, so we can't log this event.
+    // That doesn't mean we shouldn't still enforce the rule though.
+
+    return retval;
+  }
+
+  // Fill in the event info
+  init_event(alert, task);
+  alert->event_id = event_id;
+  alert->retval = retval;
+  alert->flags = flags;
+
+  // Fill in path and/or source if they were provided
+  if (path != NULL) {
+    bpf_probe_read_str(&alert->data.path, sizeof(alert->data.path), path);
+  }
+  if (source != NULL) {
+    bpf_probe_read_str(&alert->data.source, sizeof(alert->data.source), source);
+  }
+
+  // Submit the event to KubeArmor
+  bpf_ringbuf_submit(alert, BPF_RB_FORCE_WAKEUP);
+
+  return retval;
+}
+
+// match_with_info() returns the best-matching rule for the given path, source,
+// and rule mask, or RULE_NONE if no rule matched.
+static __always_inline u32 match_with_info(
+  u32 *inner,
+  struct task_struct *task,
+  char *path,
+  char *source,
+  u32 mask,
+  bool can_dir_match
+) {
+  if (path == NULL) {
+    can_dir_match = false;
+  }
+
+  // Get a pointer to the 'zero' rule key (always zeroed-out)
+  u32 zero_idx = RULE_KEY_ID_ZERO;
+  struct rule_key *zero_key = bpf_map_lookup_elem(&rule_keys, &zero_idx);
+  if (zero_key == NULL) {
+    return RULE_NONE;
+  }
+
+  // Get a pointer to the general-purpose rule key
+  u32 gp_idx = RULE_KEY_ID_GP;
+  struct rule_key *gp_key = bpf_map_lookup_elem(&rule_keys, &gp_idx);
+  if (gp_key == NULL) {
+    return RULE_NONE;
+  }
+
+  u32 *rule_ptr = NULL; // Used for direct map accesses
+  u32 rule = RULE_NONE; // Used for non-inlined function calls, since they can't return pointers
+
+  if (source != NULL) {
+    // Set up gp_key for an exact path+source match
+    bpf_map_update_elem(&rule_keys, &gp_idx, zero_key, BPF_ANY); // Copy from zero_key to gp_key
+    bpf_probe_read_str(gp_key->path, sizeof(gp_key->path), path);
+    bpf_probe_read_str(gp_key->source, sizeof(gp_key->source), source);
+
+    // Check the inner map for an exact match, returning if found
+    rule_ptr = bpf_map_lookup_elem(inner, gp_key);
+    if (rule_ptr != NULL && (*rule_ptr & mask)) {
+      return *rule_ptr & mask;
+    }
+
+    if (can_dir_match) {
+      // Set up gp_key with only source, using it as a template for a directory
+      // match
+      bpf_map_update_elem(&rule_keys, &gp_idx, zero_key, BPF_ANY); // Copy from zero_key to gp_key
+      bpf_probe_read_str(gp_key->source, sizeof(gp_key->source), source);
+
+      // Do a check for any parent directory matches, using gp_key as a template,
+      // and RULE_KEY_ID_SCRATCH_1 as a working key
+      rule = match_dir(inner, path, gp_key, RULE_KEY_ID_SCRATCH_1, mask);
+      if (rule & mask) {
+        return rule & mask;
+      }
+    }
+  }
+
+  // Set up gp_key for an exact path match (no source)
+  bpf_map_update_elem(&rule_keys, &gp_idx, zero_key, BPF_ANY); // Copy from zero_key to gp_key
+  bpf_probe_read_str(gp_key->path, sizeof(gp_key->path), path);
+
+  // Check the inner map for an exact match, returning if found
+  rule_ptr = bpf_map_lookup_elem(inner, gp_key);
+  if (rule_ptr != NULL && (*rule_ptr & mask)) {
+    return *rule_ptr & mask;
+  }
+
+  if (can_dir_match) {
+    // Do a check for any parent directory matches, using gp_key as a template,
+    // and RULE_KEY_ID_SCRATCH_1 as a working key
+    rule = match_dir(inner, path, gp_key, RULE_KEY_ID_SCRATCH_1, mask);
+    if (rule & mask) {
+      return rule & mask;
+    }
+  }
+
+  return RULE_NONE;
+}
+
+// match_and_enforce_path_hooks() matches the given path, event ID, and event
+// write status with the enforcement rules for the current container, and
+// enforces the best-matching rule, returning the appropriate LSM hook return
+// value.
+//
+// Because eBPF is weird, there's a couple things callers of this function need
+// to do in order for it to work properly:
+//
+// DO NOT pass a struct f_path * received from an LSM hook directly to this
+// function. Instead, construct a new struct path on the stack and read at
+// least the `mnt` property using BPF_CORE_READ (or bpf_probe_read), and then
+// pass the pointer to that struct. This erases certain information about the
+// pointer types, and keeps pointer types consistent further within the eBPF
+// program.
 static __always_inline int match_and_enforce_path_hooks(
   struct path *f_path,
-  u32 id,
-  u32 eventID
+  u32 event_id,
+  bool is_write_event
 ) {
-  // Alert info sent to KubeArmor
-  struct event *alert;
-
   // Get the current task
   struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 
-  // Get the 'outer' map key (PID and mount namespace IDs) that identifies the
-  // current container
-  struct outer_key okey;
-  get_outer_key(&okey, task);
-
-  // Get the 'inner' map that contains the policies for the current container
-  void *inner = bpf_map_lookup_elem(&kubearmor_containers, &okey);
-  if (!inner) {
+  // Get the inner map for the current container.
+  //
+  // Leave this at the start of this function so we can return early if this
+  // container isn't being enforced.
+  struct outer_key okey = get_outer_key(task);
+  u32 *inner = bpf_map_lookup_elem(&kubearmor_containers, &okey);
+  if (inner == NULL) {
     return 0;
   }
 
-  // Attempt to get 'inner' key buffer #0 as 'z' (always filled with 0's)
-  u32 z_idx = 0;
-  bufs_k *z = bpf_map_lookup_elem(&bufk, &z_idx);
-  if (z == NULL) {
-    return 0;
+  // Clear the path buffer
+  clear_buffer(BUFFER_ID_PATH);
+
+  // Get the path that's being accessed, and the executable accessing it
+  char *path = prepend_path(f_path, BUFFER_ID_PATH);
+  char *source = get_task_source(task, BUFFER_ID_PATH);
+
+  u32 alert_flags = 0;
+  u32 mask = RULE_MASK;
+
+  // If the current PID owns the file, set the owner flag and duplicate the mask
+  // to cover FILE_READ_BY_OWNER
+  if (is_owner_path(f_path->dentry)) {
+    alert_flags |= EVENT_FLAG_OWNER;
+    mask |= mask << RULE_OFFSET__BY_OWNER;
   }
 
-  // Attempt to get 'inner' key buffer #1 as 'tk' (zeroed out as needed)
-  u32 tk_idx = 1;
-  bufs_k *tk = bpf_map_lookup_elem(&bufk, &tk_idx);
-  if (tk == NULL) {
-    return 0;
+  // If the current event is a write event, set the write flag and duplicate the
+  // mask to cover FILE_WRITE and possibly FILE_WRITE_BY_OWNER if
+  // FILE_READ_BY_OWNER was already covered by the mask.
+  if (is_write_event) {
+    alert_flags |= EVENT_FLAG_WRITE;
+    mask |= mask << RULE_OFFSET_FILE_WRITE;
   }
 
-  // Attempt to get 'inner' key buffer #2 as 'pk' (zeroed out as needed)
-  u32 pk_idx = 2;
-  bufs_k *pk = bpf_map_lookup_elem(&bufk, &pk_idx);
-  if (pk == NULL) {
-    return 0;
+  // Get the best matching rule for this event
+  u32 rule = match_with_info(inner, task, path, source, mask, true);
+
+  // Filter the rule to only the bits that line up with the event
+  rule &= mask;
+
+  // If there's matched write rules, we care about those more than read rules,
+  // so shift them into place
+  if (rule & RULE_MASK_FILE_WRITE_ANY) {
+    rule >>= RULE_OFFSET_FILE_WRITE;
   }
 
-  // Get the path that's being accessed
-  char *path_ptr = prepend_path(f_path, PATH_BUFFER);
-
-  struct data_t *matched_policy = NULL;
-
-  // Get the current process's executable, if possible
-  void *source_str = get_task_source(task);
-
-  if (source_str != NULL) {
-    // Set up pk to check for an exact path+source match
-    bpf_map_update_elem(&bufk, &pk_idx, z, BPF_ANY);
-    bpf_probe_read_str(pk->path, MAX_STRING_SIZE, path_ptr);
-    bpf_probe_read_str(pk->source, MAX_STRING_SIZE, source_str);
-
-    // Check the inner map for an exact match
-    matched_policy = bpf_map_lookup_elem(inner, pk);
-    if (matched_policy != NULL && (matched_policy->filemask & RULE_EXEC)) {
-      goto decision;
-    }
-
-    // Zero out and store the parent process's executable in tk->source to
-    // prepare for a directory match
-    bpf_map_update_elem(&bufk, &tk_idx, z, BPF_ANY);
-    bpf_probe_read_str(tk->source, MAX_STRING_SIZE, source_str);
-
-    // Do a check for any parent directory matches, using tk as a template, and
-    // buffer #3 (otherwise unused) as a working buffer
-    matched_policy = match_dir(inner, pk->path, tk_idx, 3, RULE_EXEC, true);
-    if (matched_policy != NULL) {
-      goto decision;
-    }
+  // If there's a matched ownerOnly rule, we care about it more, so shift it
+  // into place
+  if (rule & RULE_MASK__BY_OWNER) {
+    rule >>= RULE_OFFSET__BY_OWNER;
   }
 
-  // Zero out pk, set pk->path, and check for an exact match (no source set)
-  bpf_map_update_elem(&bufk, &pk_idx, z, BPF_ANY);
-  bpf_probe_read_str(pk->path, MAX_STRING_SIZE, path_ptr);
-
-  matched_policy = bpf_map_lookup_elem(inner, pk);
-  if (matched_policy && (matched_policy->filemask & RULE_READ)) {
-    goto decision;
-  }
-
-  matched_policy = NULL;
-
-  // Do a check for any parent directory matches, using z as a template (no
-  // source set), and buffer #3 (otherwise unused) as a working buffer
-  matched_policy = match_dir(inner, pk->path, z_idx, 3, RULE_EXEC, false);
-
-decision:
-
-  // Reserve space in the output ring buffer for this event
-  alert = bpf_ringbuf_reserve(&kubearmor_events, sizeof(struct event), 0);
-  if (alert == NULL) {
-    return 0;
-  }
-
-  // Fill out common alert fields
-  init_context(alert, task);
-
-  // Read path and source strings into the alert
-  bpf_probe_read_str(&alert->data.path, MAX_STRING_SIZE, path_ptr);
-  bpf_probe_read_str(&alert->data.source, MAX_STRING_SIZE, source_str);
-
-  // Add other alert fields
-  alert->event_id = eventID;
-  alert->retval = -EPERM;
-
-  // If we found a matching policy and it's a deny policy, return permission
-  // denied and send alert to KubeArmor
-  if (matched_policy != NULL) {
-    // We found a matching policy
-
-    // TODO: fix this whole mess
-    if (id == dfileread && (~matched_policy->filemask & RULE_WRITE)) {
-      // The event is lsm/file_open and the matching policy allows read-only. We
-      // can't tell if the file is being opened for read-only or read-write, so
-      // we have to allow it and let lsm/file_permission decide if it's allowed.
-      bpf_ringbuf_discard(alert, BPF_RB_NO_WAKEUP);
-      return 0;
-    }
-
-    if (matched_policy->filemask & RULE_DENY) {
-      // The matching policy is a deny policy, return permission denied and
-      // send alert to KubeArmor
-      bpf_ringbuf_submit(alert, BPF_RB_FORCE_WAKEUP);
-      return -EPERM;
-    }
-
-    if ((matched_policy->filemask & RULE_OWNER) && !is_owner_path(f_path->dentry)) {
-      // The matching policy is an allow policy with ownerOnly: true set, so
-      // enforce that only the owner of the executable file is accessing it
-      bpf_ringbuf_submit(alert, BPF_RB_FORCE_WAKEUP);
-      return -EPERM;
-    }
-  }
-
-  // Clear out pk and set pk->path to the special value to check the default
-  // file posture
-  bpf_map_update_elem(&bufk, &pk_idx, z, BPF_ANY);
-  pk->path[0] = dfile;
-
-  struct data_t *default_posture = bpf_map_lookup_elem(inner, pk);
-
-  if (default_posture != NULL) {
-    if (default_posture->filemask == BLOCK_POSTURE) {
-      // Default posture is Block, return permission denied and send alert to
-      // KubeArmor
-      bpf_ringbuf_submit(alert, BPF_RB_FORCE_WAKEUP);
-      return -EPERM;
-    } else {
-      // Default posture is Audit, return ok and send (updated) alert to
-      // KubeArmor
-      alert->retval = 0;
-      bpf_ringbuf_submit(alert, BPF_RB_FORCE_WAKEUP);
-      return 0;
-    }
-  }
-
-  // No matching policy, no default policy, return ok and discard the alert
-  bpf_ringbuf_discard(alert, BPF_RB_NO_WAKEUP);
-  return 0;
+  // Apply the rule
+  return apply_rule(
+    inner,
+    task,
+    path,
+    source,
+    event_id,
+    alert_flags,
+    rule,
+    RULE_TYPE_FILE
+  );
 }
-
-/*
-  How do we check what to deny or not?
-
-  We match in the the following order:
-  - entity + source
-  -? directory matching + source
-  - entity
-  -? directory
-
-  Once matched
-  -? Owner Check
-  - Deny Check
-  - Check if WhiteList i.e. DefaultPosture for entity is block
-  - if not match deny
-
-  ? => Indicates optional check, like network hooks don't have owner or
-       directory checks
-*/
 
 #endif /* __SHARED_H */

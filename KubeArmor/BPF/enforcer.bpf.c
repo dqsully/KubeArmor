@@ -3,306 +3,117 @@
 /* Copyright 2023 Authors of KubeArmor */
 
 #include "shared.h"
-#include "syscalls.h"
 
 SEC("lsm/bprm_check_security")
 int BPF_PROG(enforce_proc, struct linux_binprm *bprm, int ret) {
-  // Alert info sent to KubeArmor
-  struct event *alert;
-
   // Get the current task
   struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 
-  // Get the 'outer' map key (PID and mount namespace IDs) that identifies the
-  // current container
-  struct outer_key okey;
-  get_outer_key(&okey, task);
-
-  // Get the 'inner' map that contains the policies for the current container
-  void *inner = bpf_map_lookup_elem(&kubearmor_containers, &okey);
-  if (!inner) {
-    return 0;
-  }
-
-  // Attempt to get 'inner' key buffer #0 as 'z' (always filled with 0's)
-  u32 z_idx = 0;
-  bufs_k *z = bpf_map_lookup_elem(&bufk, &z_idx);
-  if (z == NULL) {
-    return 0;
-  }
-
-  // Attempt to get 'inner' key buffer #1 as 'tk' (zeroed out as needed)
-  u32 tk_idx = 1;
-  bufs_k *tk = bpf_map_lookup_elem(&bufk, &tk_idx);
-  if (tk == NULL) {
-    return 0;
-  }
-
-  // Attempt to get 'inner' key buffer #2 as 'pk' (zeroed out as needed)
-  u32 pk_idx = 2;
-  bufs_k *pk = bpf_map_lookup_elem(&bufk, &pk_idx);
-  if (pk == NULL) {
-    return 0;
-  }
-
-  // Get the current process's executable
-  char *path_ptr = get_task_source(task);
-
-  // TODO: what to do if path_ptr is NULL?
-
-  // Get the parent process's executable, if possible
-  struct task_struct *parent_task = BPF_CORE_READ(task, parent);
-  char *source_str = get_task_source(parent_task);
-
-  // Matched enforcement policy
-  struct data_t *matched_policy = NULL;
-
-  if (source_str != NULL) {
-    // Set up pk to check for an exact path+source match
-    bpf_map_update_elem(&bufk, &pk_idx, z, BPF_ANY);
-    bpf_probe_read_str(pk->path, MAX_STRING_SIZE, path_ptr);
-    bpf_probe_read_str(pk->source, MAX_STRING_SIZE, source_str);
-
-    // Check the inner map for an exact match
-    matched_policy = bpf_map_lookup_elem(inner, pk);
-    if (matched_policy != NULL && (matched_policy->processmask & RULE_EXEC)) {
-      goto decision;
-    }
-
-    // Zero out and store the parent process's executable in tk->source to
-    // prepare for a directory match
-    bpf_map_update_elem(&bufk, &tk_idx, z, BPF_ANY);
-    bpf_probe_read_str(tk->source, MAX_STRING_SIZE, source_str);
-
-    // Do a check for any parent directory matches, using tk as a template, and
-    // buffer #3 (otherwise unused) as a working buffer
-    matched_policy = match_dir(inner, pk->path, tk_idx, 3, RULE_EXEC, false);
-    if (matched_policy != NULL) {
-      goto decision;
-    }
-  }
-
-  // Zero out pk, set pk->path, and check for an exact match (no source set)
-  bpf_map_update_elem(&bufk, &pk_idx, z, BPF_ANY);
-  bpf_probe_read_str(pk->path, MAX_STRING_SIZE, path_ptr);
-
-  matched_policy = bpf_map_lookup_elem(inner, pk);
-  if (matched_policy && (matched_policy->processmask & RULE_EXEC)) {
-    goto decision;
-  }
-
-  matched_policy = NULL;
-
-  // Do a check for any parent directory matches, using z as a template (no
-  // source set), and buffer #3 (otherwise unused) as a working buffer
-  matched_policy = match_dir(inner, pk->path, z_idx, 3, RULE_EXEC, false);
-
-decision:
-
-  // Reserve space in the output ring buffer for this event
-  alert = bpf_ringbuf_reserve(&kubearmor_events, sizeof(struct event), 0);
-  if (alert == NULL) {
-    return 0;
-  }
-
-  // Fill out common alert fields
-  init_context(alert, task);
-
-  // Read path and source strings into the alert
-  bpf_probe_read_str(&alert->data.path, MAX_STRING_SIZE, path_ptr);
-  bpf_probe_read_str(&alert->data.source, MAX_STRING_SIZE, source_str);
-
-  // Add other alert fields
-  alert->event_id = _SECURITY_BPRM_CHECK;
-  alert->retval = -EPERM;
-
-  // If we found a matching policy and it's a deny policy, return permission
-  // denied and send alert to KubeArmor
-  if (matched_policy != NULL) {
-    // We found a matching policy
-
-    if (matched_policy->processmask & RULE_DENY) {
-      // The matching policy is a deny policy, return permission denied and send
-      // alert to KubeArmor
-      bpf_ringbuf_submit(alert, BPF_RB_FORCE_WAKEUP);
-      return -EPERM;
-    }
-
-    if ((matched_policy->processmask & RULE_OWNER) && !is_owner(bprm->file)) {
-      // The matching policy is an allow policy with ownerOnly: true set, so
-      // enforce that only the owner of the executable file is calling it
-      bpf_ringbuf_submit(alert, BPF_RB_FORCE_WAKEUP);
-      return -EPERM;
-    }
-
-    // Otherwise, the matching policy is an allow policy, return ok and discard
-    // the alert
-    bpf_ringbuf_discard(alert, BPF_RB_NO_WAKEUP);
-    return 0;
-  }
-
-  // Clear out pk and set pk->path to the special value to check the default
-  // process posture
-  bpf_map_update_elem(&bufk, &pk_idx, z, BPF_ANY);
-  pk->path[0] = dproc;
-
-  struct data_t *default_posture = bpf_map_lookup_elem(inner, pk);
-
-  if (default_posture != NULL) {
-    if (default_posture->processmask == BLOCK_POSTURE) {
-      // Default posture is Block, return permission denied and send alert to
-      // KubeArmor
-      bpf_ringbuf_submit(alert, BPF_RB_FORCE_WAKEUP);
-      return -EPERM;
-    } else {
-      // Default posture is Audit, return ok and send (updated) alert to
-      // KubeArmor
-      alert->retval = 0;
-      bpf_ringbuf_submit(alert, BPF_RB_FORCE_WAKEUP);
-      return 0;
-    }
-  }
-
-  // No matching policy, no default policy, return ok and discard the alert
-  bpf_ringbuf_discard(alert, BPF_RB_NO_WAKEUP);
-  return 0;
-}
-
-static __always_inline int match_net_policies(int type, int protocol, u32 eventID) {
-  // Alert info sent to KubeArmor
-  struct event *alert;
-
-  // Current process/thread
-  struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-
-  // Get the 'outer' map key (PID and mount namespace IDs) that identifies the
-  // current container
-  struct outer_key okey;
-  get_outer_key(&okey, task);
-
-  // Get the 'inner' map that contains the policies for the current container
+  // Get the inner map for the current container.
+  //
+  // Leave this at the start of this function so we can return early if this
+  // container isn't being enforced.
+  struct outer_key okey = get_outer_key(task);
   u32 *inner = bpf_map_lookup_elem(&kubearmor_containers, &okey);
   if (inner == NULL) {
     return 0;
   }
 
-  // Attempt to get 'inner' key buffer #0 as 'z' (always filled with 0's)
-  u32 zero = 0;
-  bufs_k *z = bpf_map_lookup_elem(&bufk, &zero);
-  if (z == NULL)
-    return 0;
+  // Clear the path buffer
+  clear_buffer(BUFFER_ID_PATH);
 
-  // Attempt to get 'inner' key buffer #1 as 'p' (used to find a matching policy)
-  u32 one = 1;
-  bufs_k *p = bpf_map_lookup_elem(&bufk, &one);
-  if (p == NULL)
-    return 0;
+  // Get the path that's being accessed, and the executable accessing it
+  //
+  // security_bprm_check() in the Linux kernel is called before the current task
+  // is updated for the new executable (while handling the `execve` syscall).
+  // This means that the 'parent' executable is actually still the current
+  // task's executable.
+  struct path f_path = BPF_CORE_READ(bprm->file, f_path);
+  char *path = prepend_path(&f_path, BUFFER_ID_PATH);
+  char *source = get_task_source(task, BUFFER_ID_PATH);
 
-  // Zero out p (buffer #1) in a single instruction
-  bpf_map_update_elem(&bufk, &one, z, BPF_ANY);
+  u32 alert_flags = 0;
+  u32 mask = RULE_MASK << RULE_OFFSET_PROCESS_EXECUTE;
 
-  // Network protocol info
-  struct sockinfo sock = {.type = type, .proto = protocol};
-  // Matched enforcement policy
-  struct data_t *matched_policy = NULL;
-
-  if (protocol == 0) {
-    if (type == SOCK_STREAM) {
-      sock.proto = IPPROTO_TCP;
-    } else if (type == SOCK_DGRAM) {
-      sock.proto = IPPROTO_UDP;
-    }
+  // If the current PID owns the file, set the owner flag and duplicate the mask
+  // to cover PROCESS_EXECUTE_BY_OWNER
+  if (is_owner_path(f_path.dentry)) {
+    alert_flags |= EVENT_FLAG_OWNER;
+    mask |= mask << RULE_OFFSET__BY_OWNER;
   }
 
-  // Set p->path to a binary representation of the socket info
-  p->path[0] = NET_MATCH;
-  p->path[1] = sock.type;
-  p->path[2] = sock.proto;
+  // Get the best matching rule for this event
+  u32 rule = match_with_info(inner, task, path, source, mask, true);
 
-  // Get the process's executable, if possible (NULL-terminated string)
-  char *source_str = get_task_source(task);
+  // Filter the rule to only the bits that line up with the event
+  rule &= mask;
 
-  if (source_str != NULL) {
-    bpf_probe_read_str(p->source, MAX_STRING_SIZE, source_str);
-
-    // Check the inner map for a matching policy
-    matched_policy = bpf_map_lookup_elem(inner, p);
-
-    if (matched_policy) {
-      goto decision;
-    }
-
-    // Clear out p and reset p->path since we didn't find a match
-    bpf_map_update_elem(&bufk, &one, z, BPF_ANY);
-
-    p->path[0] = NET_MATCH;
-    p->path[1] = sock.type;
-    p->path[2] = sock.proto;
+  // If there's a matched ownerOnly rule, we care about it more, so shift it
+  // into place
+  if (rule & RULE_MASK__BY_OWNER) {
+    rule >>= RULE_OFFSET__BY_OWNER;
   }
 
-  // Check the inner map for a matching policy (no source binary path)
-  matched_policy = bpf_map_lookup_elem(inner, p);
+  // Apply the rule
+  return apply_rule(
+    inner,
+    task,
+    path,
+    source,
+    _SECURITY_BPRM_CHECK,
+    alert_flags,
+    rule,
+    RULE_TYPE_FILE
+  );
+}
 
-decision:
+static __always_inline int match_net_policies(
+  int socket_type,
+  int protocol,
+  u32 event_id
+) {
+  // Get the current task
+  struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 
-  // Reserve space in the output ring buffer for this event
-  alert = bpf_ringbuf_reserve(&kubearmor_events, sizeof(struct event), 0);
-  if (alert == NULL) {
-    return 0;
-  }
-
-  // Fill out common alert fields
-  init_context(alert, task);
-
-  // Read path and source strings into the alert
-  bpf_probe_read_kernel_str(&alert->data.path, MAX_STRING_SIZE, p->path);
-  bpf_probe_read_kernel_str(&alert->data.source, MAX_STRING_SIZE, p->source);
-
-  // Add other alert fields
-  alert->event_id = eventID;
-  alert->retval = -EPERM;
-
-  if (matched_policy != NULL) {
-    // We found a matching policy
-
-    if (matched_policy->processmask & RULE_DENY) {
-      // The matching policy is a deny policy, return permission denied and send
-      // alert to KubeArmor
-      bpf_ringbuf_submit(alert, BPF_RB_FORCE_WAKEUP);
-      return -EPERM;
-    }
-
-    // Otherwise, the matching policy is an allow policy, return ok and discard the
-    // alert
-    bpf_ringbuf_discard(alert, BPF_RB_NO_WAKEUP);
+  // Get the inner map for the current container.
+  //
+  // Leave this at the start of this function so we can return early if this
+  // container isn't being enforced.
+  struct outer_key okey = get_outer_key(task);
+  u32 *inner = bpf_map_lookup_elem(&kubearmor_containers, &okey);
+  if (inner == NULL) {
     return 0;
   }
 
-  // Clear out p and set p->path to the a special value to check the default
-  // network posture
-  bpf_map_update_elem(&bufk, &one, z, BPF_ANY);
-  p->path[0] = dnet;
+  // Clear the path buffer
+  clear_buffer(BUFFER_ID_PATH);
 
-  struct data_t *default_posture = bpf_map_lookup_elem(inner, p);
+  // Construct a 'path string' out of the socket type and protocol
+  struct network_rule_key path;
+  path.rule_type = RULE_TYPE_NETWORK;
+  path.socket_type = socket_type;
+  path.protocol = protocol;
+  path.null_byte = '\0';
 
-  if (default_posture != NULL) {
-    if (default_posture->processmask == BLOCK_POSTURE) {
-      // Default posture is Block, return permission denied and send alert to
-      // KubeArmor
-      bpf_ringbuf_submit(alert, BPF_RB_FORCE_WAKEUP);
-      return -EPERM;
-    } else {
-      // Default posture is Audit, return ok and send (updated) alert to
-      // KubeArmor
-      alert->retval = 0;
-      bpf_ringbuf_submit(alert, BPF_RB_FORCE_WAKEUP);
-      return 0;
-    }
-  }
+  // Get the executable accessing the socket
+  char *source = get_task_source(task, BUFFER_ID_PATH);
 
-  // No matching policy, no default policy, return ok and discard the alert
-  bpf_ringbuf_discard(alert, BPF_RB_NO_WAKEUP);
-  return 0;
+  u32 alert_flags = 0;
+
+  // Get the best matching rule for this event
+  u32 rule = match_with_info(inner, task, path.raw, source, RULE_MASK, false);
+
+  // Apply the rule
+  return apply_rule(
+    inner,
+    task,
+    path.raw,
+    source,
+    event_id,
+    alert_flags,
+    rule,
+    RULE_TYPE_FILE
+  );
 }
 
 SEC("lsm/socket_create")
@@ -324,9 +135,9 @@ SEC("lsm/socket_accept")
 LSM_NET(enforce_net_accept, _SOCKET_ACCEPT);
 
 SEC("lsm/file_open")
-int BPF_PROG(enforce_file, struct file *file) { // check if ret code available
+int BPF_PROG(enforce_file, struct file *file) {
   struct path f_path = BPF_CORE_READ(file, f_path);
-  return match_and_enforce_path_hooks(&f_path, dfileread, _FILE_OPEN);
+  return match_and_enforce_path_hooks(&f_path, _FILE_OPEN, false);
 }
 
 SEC("lsm/file_permission")
@@ -338,5 +149,5 @@ int BPF_PROG(enforce_file_perm, struct file *file, int mask) {
   }
 
   struct path f_path = BPF_CORE_READ(file, f_path);
-  return match_and_enforce_path_hooks(&f_path, dfilewrite, _FILE_PERMISSION);
+  return match_and_enforce_path_hooks(&f_path, _FILE_PERMISSION, true);
 }
