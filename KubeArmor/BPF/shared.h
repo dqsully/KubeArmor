@@ -112,6 +112,10 @@ struct {
   __uint(pinning, LIBBPF_PIN_BY_NAME);
 } kubearmor_containers SEC(".maps");
 
+// struct network_rule_key is a pseudo-path rule key for network rules. It
+// allows us to encode binary network information into the path field of the
+// rule_key, so that we could use it like any other path string during rule
+// matching.
 struct network_rule_key {
   union {
     // Network rules apply by protocol/socket type, there's no path involved. So
@@ -705,8 +709,8 @@ static __always_inline int apply_rule(
   return retval;
 }
 
-// match_with_info() returns the best-matching rule for the given path, source,
-// and rule mask, or RULE_NONE if no rule matched.
+// match_with_info() returns the best-matching rule (already masked) for the
+// given path, source, and rule mask, or RULE_NONE if no rule matched.
 static __always_inline u32 match_with_info(
   u32 *inner,
   struct task_struct *task,
@@ -844,9 +848,6 @@ static __always_inline int match_and_enforce_path_hooks(
 
   // Get the best matching rule for this event
   u32 rule = match_with_info(inner, task, path, source, mask, true);
-
-  // Filter the rule to only the bits that line up with the event
-  rule &= mask;
 
   // If there's matched write rules, we care about those more than read rules,
   // so shift them into place
