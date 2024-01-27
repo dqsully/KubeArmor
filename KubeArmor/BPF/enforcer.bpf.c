@@ -42,6 +42,13 @@ int BPF_PROG(enforce_proc, struct linux_binprm *bprm, int ret) {
     mask |= mask << RULE_OFFSET__BY_OWNER;
   }
 
+  // Trick the eBPF verifier into thinking flags can be any u32
+  bpf_probe_read(&alert_flags, sizeof(alert_flags), &alert_flags);
+
+  // Trick the eBPF verifier into thinking mask can be any u32, reducing
+  // instruction complexity by about 2x.
+  bpf_probe_read(&mask, sizeof(mask), &mask);
+
   // Get the best matching rule for this event
   u32 rule = match_with_info(inner, task, path, source, mask, true);
 
@@ -125,7 +132,7 @@ int BPF_PROG(enforce_net_create, int family, int type, int protocol) {
   int BPF_PROG(name, struct socket *sock) {                                    \
     int type = sock->type;                                                     \
     int protocol = sock->sk->sk_protocol;                                      \
-    return match_net_policies(type, protocol, ID);                                \
+    return match_net_policies(type, protocol, ID);                             \
   }
 
 SEC("lsm/socket_connect")
@@ -137,7 +144,7 @@ LSM_NET(enforce_net_accept, _SOCKET_ACCEPT);
 SEC("lsm/file_open")
 int BPF_PROG(enforce_file, struct file *file) {
   struct path f_path = BPF_CORE_READ(file, f_path);
-  return match_and_enforce_path_hooks(&f_path, _FILE_OPEN, false);
+  return match_and_enforce_path_hooks_read(&f_path, _FILE_OPEN);
 }
 
 SEC("lsm/file_permission")
@@ -149,5 +156,5 @@ int BPF_PROG(enforce_file_perm, struct file *file, int mask) {
   }
 
   struct path f_path = BPF_CORE_READ(file, f_path);
-  return match_and_enforce_path_hooks(&f_path, _FILE_PERMISSION, true);
+  return match_and_enforce_path_hooks_write(&f_path, _FILE_PERMISSION);
 }

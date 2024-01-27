@@ -10,7 +10,7 @@
     struct path f_path;                                                        \
     f_path.dentry = dentry;                                                    \
     f_path.mnt = BPF_CORE_READ(dir, mnt);                                      \
-    return match_and_enforce_path_hooks(&f_path, ID, true);                    \
+    return match_and_enforce_path_hooks_write(&f_path, ID);                    \
   }
 
 PATH_SEC_CALL(mknod, _FILE_MKNOD)
@@ -25,7 +25,7 @@ int BPF_PROG(enforce_link_src, struct dentry *old_dentry, struct path *dir,
   struct path f_path;
   f_path.dentry = old_dentry;
   f_path.mnt = BPF_CORE_READ(dir, mnt);
-  return match_and_enforce_path_hooks(&f_path, _FILE_LINK, true);
+  return match_and_enforce_path_hooks_write(&f_path, _FILE_LINK);
 }
 
 SEC("lsm/path_link")
@@ -34,7 +34,7 @@ int BPF_PROG(enforce_link_dst, struct dentry *old_dentry, struct path *dir,
   struct path f_path;
   f_path.dentry = new_dentry;
   f_path.mnt = BPF_CORE_READ(dir, mnt);
-  return match_and_enforce_path_hooks(&f_path, _FILE_LINK, true);
+  return match_and_enforce_path_hooks_write(&f_path, _FILE_LINK);
 }
 
 SEC("lsm/path_rename")
@@ -43,7 +43,7 @@ int BPF_PROG(enforce_rename_old, struct path *old_dir,
   struct path f_path;
   f_path.dentry = old_dentry;
   f_path.mnt = BPF_CORE_READ(old_dir, mnt);
-  return match_and_enforce_path_hooks(&f_path, _FILE_RENAME, true);
+  return match_and_enforce_path_hooks_write(&f_path, _FILE_RENAME);
 }
 
 SEC("lsm/path_rename")
@@ -53,7 +53,7 @@ int BPF_PROG(enforce_rename_new, struct path *old_dir,
   struct path f_path;
   f_path.dentry = new_dentry;
   f_path.mnt = BPF_CORE_READ(new_dir, mnt);
-  return match_and_enforce_path_hooks(&f_path, _FILE_RENAME, true);
+  return match_and_enforce_path_hooks_write(&f_path, _FILE_RENAME);
 }
 
 SEC("lsm/path_chmod")
@@ -69,12 +69,12 @@ int BPF_PROG(enforce_chmod, struct path *p) {
   struct path f_path;
   f_path.dentry = BPF_CORE_READ(p, dentry);
   f_path.mnt = BPF_CORE_READ(p, mnt);
-  return match_and_enforce_path_hooks(&f_path, _FILE_CHMOD, true);
+  return match_and_enforce_path_hooks_write(&f_path, _FILE_CHMOD);
 }
 
 // SEC("lsm/path_chown")
 // int BPF_PROG(enforce_chown, struct path *p) {
-//   return match_and_enforce_path_hooks(p, _FILE_CHOWN, true);
+//   return match_and_enforce_path_hooks_write(p, _FILE_CHOWN);
 // }
 
 SEC("lsm/path_truncate")
@@ -90,5 +90,5 @@ int BPF_PROG(enforce_truncate, struct path *p) {
   struct path f_path;
   f_path.dentry = BPF_CORE_READ(p, dentry);
   f_path.mnt = BPF_CORE_READ(p, mnt);
-  return match_and_enforce_path_hooks(&f_path, _FILE_TRUNCATE, true);
+  return match_and_enforce_path_hooks_write(&f_path, _FILE_TRUNCATE);
 }

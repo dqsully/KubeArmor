@@ -48,6 +48,7 @@ char LICENSE[] SEC("license") = "Dual BSD/GPL";
 #define RULE_TYPE_FILE 1
 #define RULE_TYPE_PROCESS 2
 #define RULE_TYPE_NETWORK 3
+#define RULE_TYPE_DEFAULT 0xFF
 
 // Generic rule bitwise offsets
 #define RULE_OFFSET__BY_OWNER 4 // _BY_OWNER offsets should always be +4 from the more-generic offset
@@ -158,8 +159,7 @@ struct rule_key {
 
 #define RULE_KEY_ID_ZERO 0      // This rule key is always left zeroed-out
 #define RULE_KEY_ID_GP 1        // General-purpose rule key, used for exact matches or as a match template for recursive rules
-#define RULE_KEY_ID_SCRATCH_1 2 // Scratch rule key, can be used by functions for temporary storage
-#define NUM_RULE_KEYS 3         // Number of rule key slots
+#define NUM_RULE_KEYS 2         // Number of rule key slots
 
 // rule_keys is a per-CPU array of rule_key structs for use during rule
 // enforcement.
@@ -377,7 +377,6 @@ static char *prepend_path(struct path *path, int buf_idx) {
       dentry = BPF_CORE_READ(mnt, mnt_mountpoint);
       mnt = m;
       mnt_root = BPF_CORE_READ(&mnt->mnt, mnt_root);
-      parent = BPF_CORE_READ(dentry, d_parent);
 
       // This continue is kinda funky being here, but it makes the complexity of
       // this loop go from O(n^>2) to O(n^<1) in testing. I couldn't tell you
@@ -499,22 +498,19 @@ static __always_inline u32 init_event(
   return 0;
 }
 
-// TODO: optimize for instruction complexity?
+// match_dir() returns the best-matching directory rule (not pre-masked) for the
+// given path and mask, or RULE_NONE if no rule matched.
+//
+// The passed key must have a completely empty path field, since this will write
+// into the path field as needed.
 static u32 match_dir(
   void *inner,
   char *path,
-  struct rule_key *in_key,
-  int working_key_idx,
+  struct rule_key *key,
   u32 mask
 ) {
-  // Inner key used for checking against inner map
-  struct rule_key *key = bpf_map_lookup_elem(&rule_keys, &working_key_idx);
-  if (key == NULL) {
-    return RULE_NONE;
-  }
-
-  u32 *recursive_rule = NULL;
   u32 *dir_rule = NULL;
+  u32 recursive_rule_masked = RULE_NONE;
 
   // Check for recursive and non-recursive directory matches
   //
@@ -532,7 +528,8 @@ static u32 match_dir(
   // as far as the policies go, then /foo/bar/baz/ will be NULL and any
   // previously-saved recursive rule will apply instead.
   //
-  // TODO: fix the cyclic complexity in this loop
+  // >50% of all program complexity is caused by this loop, so any small state
+  // or instruction optimizations can go a really long way.
   for (int i = 0; i < RULE_KEY_STR_LEN - 1; i++) {
     // If we've reached the end of the string, break
     if (path[i] == '\0') {
@@ -545,9 +542,10 @@ static u32 match_dir(
       continue;
     }
 
-    // Copy from input key into working key, and set its path to the
-    // directory we're about to check for
-    bpf_map_update_elem(&rule_keys, &working_key_idx, in_key, BPF_ANY);
+    // Write out the now-deeper path we're checking.
+    //
+    // Yes, this 'needlessly' overwrites bytes in key that were already written,
+    // but this way is much simpler for eBPF to verify.
     bpf_probe_read_str(key->path, i + 2, path);
 
     // Check the inner map for a matching rule, and stop looking if we couldn't
@@ -564,12 +562,12 @@ static u32 match_dir(
     if (*dir_rule & mask & RULE_MASK_ANY_RECURSIVE) {
       if (*dir_rule & mask & RULE_MASK_ANY_HINT) {
         // There are more-specific policies within this directory, so save the
-        // current directory rule as the most-specific recursive rule so far
-        recursive_rule = dir_rule;
+        // current directory rule as the most-specific recursive rule so far.
+        recursive_rule_masked = *dir_rule & mask;
       } else {
         // There are no more-specific policies within this directory, so return
         // the current directory rule
-        return *dir_rule;
+        return *dir_rule & mask;
       }
     }
   }
@@ -578,16 +576,12 @@ static u32 match_dir(
   // most specific rule possible. This is for both recursive and non-recursive
   // policies.
   if (dir_rule != NULL && (*dir_rule & mask)) {
-    return *dir_rule;
+    return *dir_rule & mask;
   }
 
   // Otherwise, return the most-recent recursive rule we found along the way, if
   // any
-  if (recursive_rule != NULL) {
-    return *recursive_rule;
-  }
-
-  return RULE_NONE;
+  return recursive_rule_masked;
 }
 
 // get_outer_key() returns the outer_key for the given task.
@@ -628,9 +622,7 @@ static __always_inline char *get_task_source(
 static __always_inline bool is_owner_path(struct dentry *dent) {
   kuid_t owner = BPF_CORE_READ(dent, d_inode, i_uid);
   unsigned int z = bpf_get_current_uid_gid();
-  if (owner.val != z)
-    return false;
-  return true;
+  return owner.val == z;
 }
 
 // apply_rule() determines the return value for a given event, and submits it to
@@ -646,14 +638,26 @@ static __always_inline int apply_rule(
   u32 rule,
   u32 rule_type
 ) {
+  // We only care about the lowest 2 bits of the rule
+  rule = rule & 3;
+
   // If there wasn't a matched rule, look up the default rule
   if (rule == RULE_NONE) {
     u32 zero_idx = RULE_KEY_ID_ZERO;
     struct rule_key *zero_key = bpf_map_lookup_elem(&rule_keys, &zero_idx);
-    if (zero_key != NULL) {
-      u32 *default_rule = bpf_map_lookup_elem(inner, zero_key);
+
+    u32 gp_idx = RULE_KEY_ID_GP;
+    struct rule_key *gp_key = bpf_map_lookup_elem(&rule_keys, &gp_idx);
+
+    if (zero_key != NULL && gp_key != NULL) {
+      // Zero out gp_key and set it up for a default rule lookup
+      bpf_map_update_elem(&rule_keys, &gp_idx, zero_key, BPF_ANY); // Copy from zero_key to gp_key
+      gp_key->path[0] = RULE_TYPE_DEFAULT;
+
+      u32 *default_rule = bpf_map_lookup_elem(inner, gp_key);
       if (default_rule != NULL) {
-        // If there is a default rule set, get the lowest 2 bits for the rule type
+        // If there is a default rule set, get the lowest 2 bits for the rule
+        // type
         rule = (*default_rule >> ((rule_type - 1) * 4)) & 3;
       }
     }
@@ -685,7 +689,6 @@ static __always_inline int apply_rule(
   if (alert == NULL) {
     // We couldn't reserve space on the ring buffer, so we can't log this event.
     // That doesn't mean we shouldn't still enforce the rule though.
-
     return retval;
   }
 
@@ -758,11 +761,11 @@ static __always_inline u32 match_with_info(
       bpf_map_update_elem(&rule_keys, &gp_idx, zero_key, BPF_ANY); // Copy from zero_key to gp_key
       bpf_probe_read_str(gp_key->source, sizeof(gp_key->source), source);
 
-      // Do a check for any parent directory matches, using gp_key as a template,
-      // and RULE_KEY_ID_SCRATCH_1 as a working key
-      rule = match_dir(inner, path, gp_key, RULE_KEY_ID_SCRATCH_1, mask);
-      if (rule & mask) {
-        return rule & mask;
+      // Do a check for any parent directory matches using gp_key (pre-filled
+      // with source). The returned rule is already masked.
+      rule = match_dir(inner, path, gp_key, mask);
+      if (rule) {
+        return rule;
       }
     }
   }
@@ -778,11 +781,14 @@ static __always_inline u32 match_with_info(
   }
 
   if (can_dir_match) {
-    // Do a check for any parent directory matches, using gp_key as a template,
-    // and RULE_KEY_ID_SCRATCH_1 as a working key
-    rule = match_dir(inner, path, gp_key, RULE_KEY_ID_SCRATCH_1, mask);
-    if (rule & mask) {
-      return rule & mask;
+    // Zero out gp_key for a directory match
+    bpf_map_update_elem(&rule_keys, &gp_idx, zero_key, BPF_ANY); // Copy from zero_key to gp_key
+
+    // Do a check for any parent directory matches using gp_key (now zeroed
+    // out). The returned rule is already masked.
+    rule = match_dir(inner, path, gp_key, mask);
+    if (rule) {
+      return rule;
     }
   }
 
@@ -803,10 +809,83 @@ static __always_inline u32 match_with_info(
 // pass the pointer to that struct. This erases certain information about the
 // pointer types, and keeps pointer types consistent further within the eBPF
 // program.
-static __always_inline int match_and_enforce_path_hooks(
+static __always_inline int match_and_enforce_path_hooks_write(
   struct path *f_path,
-  u32 event_id,
-  bool is_write_event
+  u32 event_id
+) {
+  // Get the current task
+  struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+
+  // Get the inner map for the current container.
+  //
+  // Leave this at the start of this function so we can return early if this
+  // container isn't being enforced.
+  struct outer_key okey = get_outer_key(task);
+  u32 *inner = bpf_map_lookup_elem(&kubearmor_containers, &okey);
+  if (inner == NULL) {
+    return 0;
+  }
+
+  // Clear the path buffer
+  clear_buffer(BUFFER_ID_PATH);
+
+  // Get the path that's being accessed, and the executable accessing it
+  char *path = prepend_path(f_path, BUFFER_ID_PATH);
+  char *source = get_task_source(task, BUFFER_ID_PATH);
+
+  u32 alert_flags = EVENT_FLAG_WRITE;
+  u32 mask = RULE_MASK | (RULE_MASK << RULE_OFFSET_FILE_WRITE);
+
+  // If the current PID owns the file, set the owner flag and duplicate the mask
+  // to cover FILE_READ_BY_OWNER
+  if (is_owner_path(f_path->dentry)) {
+    alert_flags |= EVENT_FLAG_OWNER;
+    mask |= mask << RULE_OFFSET__BY_OWNER;
+  }
+
+  // For some reason, trying to trick eBPF into thinking alert_flags can be any
+  // u32 here doesn't provide any benefit.
+
+  // Trick the eBPF verifier into thinking mask can be any u32, reducing
+  // instruction complexity by about 2x.
+  bpf_probe_read(&mask, sizeof(mask), &mask);
+
+  // Get the best matching rule for this event
+  u32 rule = match_with_info(inner, task, path, source, mask, true);
+
+  // If there's matched write rules, we care about those more than read rules,
+  // so shift them into place
+  if (rule & RULE_MASK_FILE_WRITE_ANY) {
+    rule >>= RULE_OFFSET_FILE_WRITE;
+  }
+
+  // If there's a matched ownerOnly rule, we care about it more, so shift it
+  // into place
+  if (rule & RULE_MASK__BY_OWNER) {
+    rule >>= RULE_OFFSET__BY_OWNER;
+  }
+
+  // Apply the rule
+  return apply_rule(
+    inner,
+    task,
+    path,
+    source,
+    event_id,
+    alert_flags,
+    rule,
+    RULE_TYPE_FILE
+  );
+}
+
+// match_and_enforce_path_hooks_read() is a near-duplicate of the write variant,
+// but by explicitly separating them, for some reason clang can do much better
+// optimizations for the enforce_file and enforce_file_perm hooks.
+//
+// See match_and_enforce_path_hooks_write() for more details.
+static __always_inline int match_and_enforce_path_hooks_read(
+  struct path *f_path,
+  u32 event_id
 ) {
   // Get the current task
   struct task_struct *task = (struct task_struct *)bpf_get_current_task();
@@ -838,22 +917,15 @@ static __always_inline int match_and_enforce_path_hooks(
     mask |= mask << RULE_OFFSET__BY_OWNER;
   }
 
-  // If the current event is a write event, set the write flag and duplicate the
-  // mask to cover FILE_WRITE and possibly FILE_WRITE_BY_OWNER if
-  // FILE_READ_BY_OWNER was already covered by the mask.
-  if (is_write_event) {
-    alert_flags |= EVENT_FLAG_WRITE;
-    mask |= mask << RULE_OFFSET_FILE_WRITE;
-  }
+  // Trick the eBPF verifier into thinking flags can be any u32
+  bpf_probe_read(&alert_flags, sizeof(alert_flags), &alert_flags);
+
+  // Trick the eBPF verifier into thinking mask can be any u32, reducing
+  // instruction complexity by about 2x.
+  bpf_probe_read(&mask, sizeof(mask), &mask);
 
   // Get the best matching rule for this event
   u32 rule = match_with_info(inner, task, path, source, mask, true);
-
-  // If there's matched write rules, we care about those more than read rules,
-  // so shift them into place
-  if (rule & RULE_MASK_FILE_WRITE_ANY) {
-    rule >>= RULE_OFFSET_FILE_WRITE;
-  }
 
   // If there's a matched ownerOnly rule, we care about it more, so shift it
   // into place
