@@ -36,6 +36,21 @@ char LICENSE[] SEC("license") = "Dual BSD/GPL";
 #define MASK_READ 0x00000004
 #define MASK_APPEND 0x00000008
 
+/* relax_verifier is a dummy helper call to introduce a pruning checkpoint
+ * to help relax the verifier to avoid reaching complexity limits.
+ */
+static inline __attribute__((always_inline)) void relax_verifier(void)
+{
+	/* Calling get_smp_processor_id() in asm saves an instruction as we
+	 * don't have to store the result to ensure the call takes place.
+	 * However, we have to specifiy the call target by number and not
+	 * name, hence 'call 8'. This is unlikely to change, though, so this
+	 * isn't a big issue.
+	 */
+	asm volatile("call 8;\n" ::
+			     : "r0", "r1", "r2", "r3", "r4", "r5");
+}
+
 #undef container_of
 #define container_of(ptr, type, member)                                        \
   ({                                                                           \
@@ -122,15 +137,13 @@ struct network_rule_key {
     // Network rules apply by protocol/socket type, there's no path involved. So
     // this union lets us commandeer the first 3 bytes of the path field to
     // instead store the relevant network info. rule_type MUST be the first
-    // field, and it CANNOT be 47 (0x2F or the '/' character) because every path
-    // rule is going to start with that and we can't have any possible collisions.
+    // field, and it CANNOT be 47 (0x2F or the '/' character) or 36 (0x24 or the
+    // '$' character) because every path rule is going to start with one of
+    // those and we can't have any possible collisions.
     struct {
       // The non-path rule type, currently only network rules are supported in
       // keys.
       char rule_type;
-
-      // The socket type number (e.g. SOCK_STREAM, SOCK_DGRAM, etc.)
-      char socket_type;
 
       // The IP protocol number (e.g. IPPROTO_TCP, IPPROTO_UDP, etc.)
       char protocol;
@@ -175,6 +188,7 @@ struct {
 } rule_keys SEC(".maps");
 
 #define BUFFER_LEN 32760        // 2^15 - 8 or just under 32KiB, leaving space for 2 32-bit offsets
+#define BUFFER_MASK 32767       // 2^15 - 1, used for bounds checking
 #define BUFFER_HALF_POINT 16384 // 2^14, used for bounds checking
 #define BUFFER_HALF_MASK 16383  // 2^14 - 1, used for bounds checking
 
@@ -263,9 +277,9 @@ static __always_inline void clear_buffer(int buf_idx) {
   struct buffer *buf = bpf_map_lookup_elem(&buffers, &buf_idx);
 
   if (buf != NULL) {
-    buf->prepend_offset = BUFFER_HALF_POINT;
+    buf->data[BUFFER_HALF_POINT - 1] = '\0';
+    buf->prepend_offset = BUFFER_HALF_POINT - 1;
     buf->append_offset = BUFFER_HALF_POINT;
-    buf->data[BUFFER_HALF_POINT] = '\0';
   }
 }
 
@@ -320,6 +334,32 @@ static __always_inline struct mount *real_mount(struct vfsmount *mnt) {
   return container_of(mnt, struct mount, mnt);
 }
 
+static __always_inline u32 get_vfsmount_ns_id(struct vfsmount *mnt) {
+  return BPF_CORE_READ(real_mount(mnt), mnt_ns, ns).inum;
+}
+
+static __always_inline struct mount *get_vfsmount_ns_root(struct vfsmount *mnt) {
+  return BPF_CORE_READ(real_mount(mnt), mnt_ns, root);
+}
+
+static __always_inline u32 get_task_exe_mnt_ns_id(struct task_struct *task) {
+  struct file *file_p = get_task_file(task);
+  if (file_p == NULL) {
+    return 0xFFFFFFFF;
+  }
+
+  struct path f_path = BPF_CORE_READ(file_p, f_path);
+  return get_vfsmount_ns_id(f_path.mnt);
+}
+
+static __always_inline u32 is_task_exe_external(struct task_struct *task) {
+  return get_task_exe_mnt_ns_id(task) != get_task_mnt_ns_id(task);
+}
+
+static __always_inline u32 is_path_external(struct path *path, struct task_struct *task) {
+  return get_vfsmount_ns_id(path->mnt) != get_task_mnt_ns_id(task);
+}
+
 // prepend_path() writes out the string representation of a path to the given
 // buffer.
 static char *prepend_path(struct path *path, int buf_idx) {
@@ -334,20 +374,10 @@ static char *prepend_path(struct path *path, int buf_idx) {
   }
 
   // This needs to be a variable so that the eBPF verifier can track its state
-  s32 old_offset = buf->prepend_offset;
+  u32 offset = buf->prepend_offset & BUFFER_HALF_MASK;
 
-  // If the buffer is full, we can't write anything to it.
-  if (old_offset < 1) {
-    return NULL;
-  }
+  char path_start = '/';
 
-  // To please the eBPF verifier, cap old_offset at BUFFER_HALF_POINT as a
-  // bounds check.
-  if (old_offset > BUFFER_HALF_POINT) {
-    old_offset = BUFFER_HALF_POINT;
-  }
-
-  s32 new_offset = old_offset;
   u32 d_len;
 
   struct dentry *dentry = path->dentry;
@@ -360,16 +390,25 @@ static char *prepend_path(struct path *path, int buf_idx) {
   struct qstr d_name;
 
   for (int i = 0; i < 30; i++) {
-    // Grab the current dentry's parent
-    parent = BPF_CORE_READ(dentry, d_parent);
-
     if (dentry == mnt_root) {
       // We're at the top of the mount
+
       m = BPF_CORE_READ(mnt, mnt_parent);
 
-      // If we're at the top of the mount tree, we're done
+      // If we're at the top of the entire mount tree, we're done
       if (mnt == m) {
-        break;
+        if (get_vfsmount_ns_root(path->mnt) != mnt) {
+          // We didn't make it to the root mount of the path's namespace's
+          // filesystem, so we don't really know what the full path is...
+          offset = buf->prepend_offset - 1;
+          path_start = '?';
+        } else if (offset == buf->prepend_offset) {
+          // No path segments up to the root of the filesystem, must mean we're
+          // looking at '/' itself
+          offset = buf->prepend_offset - 1;
+        }
+
+        goto save_path;
       }
 
       // Otherwise, grab the dentry where this mount was mounted to its parent,
@@ -378,15 +417,20 @@ static char *prepend_path(struct path *path, int buf_idx) {
       mnt = m;
       mnt_root = BPF_CORE_READ(&mnt->mnt, mnt_root);
 
-      // This continue is kinda funky being here, but it makes the complexity of
-      // this loop go from O(n^>2) to O(n^<1) in testing. I couldn't tell you
-      // why... but it makes a huge difference.
+      // This continue is very important, because it allows us to properly trace
+      // filesystems mounted at the roots of other filesystems.
       continue;
     }
 
-    // Root directory, we're done
+    // Grab the current dentry's parent
+    parent = BPF_CORE_READ(dentry, d_parent);
+
+    // Orphaned entry, doesn't exist in an accessible filesystem, replace the
+    // entire path with a placeholder and break out of the loop
     if (dentry == parent) {
-      break;
+      offset = buf->prepend_offset - 1;
+      path_start = '?';
+      goto save_path;
     }
 
     // Get the dentry's static name (string with length and hash)
@@ -396,12 +440,20 @@ static char *prepend_path(struct path *path, int buf_idx) {
     // won't ever be >255 for a dentry.
     d_len = d_name.len & BUFFER_HALF_MASK;
 
+    // If the dentry doesn't have a static name, replace the entire path with a
+    // placeholder and break out of the loop
+    if (d_len == 0) {
+      offset = buf->prepend_offset - 1;
+      path_start = '?';
+      goto save_path;
+    }
+
     // Rewind in the buffer to where the start of the name can go
-    new_offset -= (d_len + 1);
+    offset -= (d_len + 1);
 
     // If we rewound to the buffer's start, that's a fatal error (since we need
     // to prepend a slash at the start of the path still)
-    if (new_offset < 1) {
+    if (offset > BUFFER_HALF_POINT) {
       return NULL;
     }
 
@@ -413,13 +465,13 @@ static char *prepend_path(struct path *path, int buf_idx) {
     // Instead, we tell the verifier that d_len is up to 50% of the buffer's
     // size, which in the following function call, means (to the verifier) that:
     //
-    // * new_offset may be anywhere from 1 to 16383
+    // * offset may be anywhere from 0 to 16383
     // * d_len may be anywhere from 0 to 16383
     //
     // -- therefore --
     //
-    // * bpf_probe_read_str could access anywhere from 1 to 32767 within the
-    //   buffer (the verifier can't track the relationship between new_offset
+    // * bpf_probe_read_str could access anywhere from 0 to 32767 within the
+    //   buffer (the verifier can't track the relationship between offset
     //   and d_len, just their individual bounds)
     // * the returned pointer could be anywhere from 0 to 16383 within the
     //   buffer or NULL, *regardless of how many times this loop was executed*
@@ -427,43 +479,69 @@ static char *prepend_path(struct path *path, int buf_idx) {
     // When tested with the loop running only 5 times, this hack reduced the
     // instruction complexity by 75%.
     int sz = bpf_probe_read_str(
-      &(buf->data[new_offset]),
+      &(buf->data[offset]),
       (d_len + 1),
       d_name.name
     );
 
-    if (sz > 1) {
-      // If we wrote more than one character, write a slash after the path
-      // segment (instead of the null terminator)
-      buf->data[new_offset + d_len] = '/';
-    } else {
-      // Otherwise, if the dentry had no name, pretend it didn't exist
-      new_offset += (d_len + 1);
+    // Error reading, return NULL
+    if (sz < 0) {
+      return NULL;
     }
+
+    // Write a slash after the path segment (instead of the null terminator)
+    buf->data[offset + d_len] = '/';
 
     // Check the parent on the next iteration
     dentry = parent;
   }
 
-  // Return NULL if we didn't write any paths into the buffer
-  if (new_offset == old_offset) {
+  // If we get here, it means the path was more than 30 segments deep, just
+  // return NULL since we don't know the full path
+  return NULL;
+
+save_path:
+  // offset got saved to the stack before the bounds check in the loop, and then
+  // loaded from the stack here, so we have to check its bounds again.
+  offset--;
+
+  if (offset >= BUFFER_HALF_POINT) {
     return NULL;
   }
 
-  // Write a null terminator at the end of the path so we have a null-terminated
-  // string again
-  buf->data[old_offset - 1] = '\0';
-
   // Add a slash to the beginning of the path
-  new_offset--;
-  buf->data[new_offset] = '/';
+  buf->data[offset] = path_start;
+
+  // Write a null terminator at the end of the path so we have a null-terminated
+  // string again. (We already confirmed at the start of this function that
+  // buf->prepend_offset is >= 1, but the verifier forgot that by now.)
+  buf->data[(buf->prepend_offset - 1) & BUFFER_HALF_MASK] = '\0';
 
   // Save the new buffer offset back into the map
-  buf->prepend_offset = new_offset;
+  buf->prepend_offset = offset;
 
   // Return a pointer to the start of our new null-terminated path string
-  return &buf->data[new_offset];
+  return &buf->data[offset];
 };
+
+static __always_inline char *prepend_ext(int buf_idx) {
+  // Load the buffer to write into (per CPU)
+  struct buffer *buf = bpf_map_lookup_elem(&buffers, &buf_idx);
+  if (buf == NULL) {
+    return NULL;
+  }
+
+  u32 offset = buf->prepend_offset - 1;
+
+  if (offset > BUFFER_HALF_POINT) {
+    return NULL;
+  }
+
+  buf->data[offset] = '$';
+  buf->prepend_offset = offset;
+
+  return &buf->data[offset];
+}
 
 static __always_inline u32 init_event(
   struct event *event,
@@ -603,18 +681,22 @@ static __always_inline struct outer_key get_outer_key(struct task_struct *t) {
 // the full path of the source binary of the given task, or NULL if no
 // executable was found.
 static __always_inline char *get_task_source(
-  struct task_struct *t,
+  struct task_struct *task,
   int buffer_id
 ) {
-  struct file *file_p = get_task_file(t);
+  struct file *file_p = get_task_file(task);
   if (file_p == NULL) {
     return NULL;
   }
 
-  // TODO: fix process path detection when exe_file is NULL (dynamic filesystem)
   struct path f_src = BPF_CORE_READ(file_p, f_path);
 
-  return prepend_path(&f_src, buffer_id);
+  char *path = prepend_path(&f_src, buffer_id);
+  if (path != NULL && is_path_external(&f_src, task)) {
+    path = prepend_ext(buffer_id);
+  }
+
+  return path;
 }
 
 // is_owner_path() returns true if the given dentry is owned by the current
@@ -719,13 +801,8 @@ static __always_inline u32 match_with_info(
   struct task_struct *task,
   char *path,
   char *source,
-  u32 mask,
-  bool can_dir_match
+  u32 mask
 ) {
-  if (path == NULL) {
-    can_dir_match = false;
-  }
-
   // Get a pointer to the 'zero' rule key (always zeroed-out)
   u32 zero_idx = RULE_KEY_ID_ZERO;
   struct rule_key *zero_key = bpf_map_lookup_elem(&rule_keys, &zero_idx);
@@ -755,7 +832,7 @@ static __always_inline u32 match_with_info(
       return *rule_ptr & mask;
     }
 
-    if (can_dir_match) {
+    if (path != NULL) {
       // Set up gp_key with only source, using it as a template for a directory
       // match
       bpf_map_update_elem(&rule_keys, &gp_idx, zero_key, BPF_ANY); // Copy from zero_key to gp_key
@@ -780,7 +857,7 @@ static __always_inline u32 match_with_info(
     return *rule_ptr & mask;
   }
 
-  if (can_dir_match) {
+  if (path != NULL) {
     // Zero out gp_key for a directory match
     bpf_map_update_elem(&rule_keys, &gp_idx, zero_key, BPF_ANY); // Copy from zero_key to gp_key
 
@@ -789,6 +866,84 @@ static __always_inline u32 match_with_info(
     rule = match_dir(inner, path, gp_key, mask);
     if (rule) {
       return rule;
+    }
+  }
+
+  return RULE_NONE;
+}
+
+// match_net() returns the best-matching rule (already masked) for the given
+// network rule key
+static __always_inline u32 match_net(
+  u32 *inner,
+  struct task_struct *task,
+  char *path,
+  char *source,
+  u32 mask
+) {
+  // Get a pointer to the 'zero' rule key (always zeroed-out)
+  u32 zero_idx = RULE_KEY_ID_ZERO;
+  struct rule_key *zero_key = bpf_map_lookup_elem(&rule_keys, &zero_idx);
+  if (zero_key == NULL) {
+    return RULE_NONE;
+  }
+
+  // Get a pointer to the general-purpose rule key
+  u32 gp_idx = RULE_KEY_ID_GP;
+  struct rule_key *gp_key = bpf_map_lookup_elem(&rule_keys, &gp_idx);
+  if (gp_key == NULL) {
+    return RULE_NONE;
+  }
+
+  u32 *rule_ptr = NULL; // Used for direct map accesses
+  u32 rule = RULE_NONE; // Used for non-inlined function calls, since they can't return pointers
+
+  if (source != NULL) {
+    // Set up gp_key for an exact path+source match
+    bpf_map_update_elem(&rule_keys, &gp_idx, zero_key, BPF_ANY); // Copy from zero_key to gp_key
+    bpf_probe_read_str(gp_key->path, sizeof(gp_key->path), path);
+    bpf_probe_read_str(gp_key->source, sizeof(gp_key->source), source);
+
+    // Check the inner map for an exact match, returning if found
+    rule_ptr = bpf_map_lookup_elem(inner, gp_key);
+    if (rule_ptr != NULL && (*rule_ptr & mask)) {
+      return *rule_ptr & mask;
+    }
+
+    if (gp_key->path[1] != 0) {
+      // Set up gp_key for an 'any' protocol match, since an 'any' rule on a
+      // source is more specific than a protocol on all processes
+      gp_key->path[1] = 0;
+
+      // Check the inner map for an exact match, returning if found
+      rule_ptr = bpf_map_lookup_elem(inner, gp_key);
+      if (rule_ptr != NULL && (*rule_ptr & mask)) {
+        return *rule_ptr & mask;
+      }
+    }
+  }
+
+  // Set up gp_key for an exact path match (no source)
+  bpf_map_update_elem(&rule_keys, &gp_idx, zero_key, BPF_ANY); // Copy from zero_key to gp_key
+  bpf_probe_read_str(gp_key->path, sizeof(gp_key->path), path);
+
+  // Check the inner map for an exact match, returning if found
+  rule_ptr = bpf_map_lookup_elem(inner, gp_key);
+  if (rule_ptr != NULL && (*rule_ptr & mask)) {
+    return *rule_ptr & mask;
+  }
+
+  if (gp_key->path[1] != 0) {
+    // Set up gp_key for an 'any' protocol match, because it's possible that
+    // someone wants a 'most-general' network rule for a container that isn't the
+    // default posture. File/process rules have an equivalent already anyways: a
+    // recursive directory rule at /.
+    gp_key->path[1] = 0;
+
+    // Check the inner map for an exact match, returning if found
+    rule_ptr = bpf_map_lookup_elem(inner, gp_key);
+    if (rule_ptr != NULL && (*rule_ptr & mask)) {
+      return *rule_ptr & mask;
     }
   }
 
@@ -831,6 +986,23 @@ static __always_inline int match_and_enforce_path_hooks_write(
 
   // Get the path that's being accessed, and the executable accessing it
   char *path = prepend_path(f_path, BUFFER_ID_PATH);
+  if (path != NULL && is_path_external(f_path, task)) {
+    // For now, don't enforce file access on any paths outside of the
+    // container's namespace. Theoretically this means we can't protect any file
+    // accesses from escaping the container's namespace if that's possible, but
+    // so far I've noticed a lot of expected cross-namespace file accesses that
+    // we want to allow, but it's hard to figure out how to:
+    //
+    // * "sockfs" - can't determine a filename, shows up as external mount ns
+    // * "pipefs" - similar to sockfs
+    // * container image files - anytime the container accesses a file included
+    //   in the container's image that hasn't yet been modified, it shows up
+    //   first as a file access in the container's mount namespace (on the
+    //   overlay filesystem), and then as a second file access in another mount
+    //   namespace (on the host's filesystem)
+    return 0;
+  }
+
   char *source = get_task_source(task, BUFFER_ID_PATH);
 
   u32 alert_flags = EVENT_FLAG_WRITE;
@@ -851,7 +1023,7 @@ static __always_inline int match_and_enforce_path_hooks_write(
   bpf_probe_read(&mask, sizeof(mask), &mask);
 
   // Get the best matching rule for this event
-  u32 rule = match_with_info(inner, task, path, source, mask, true);
+  u32 rule = match_with_info(inner, task, path, source, mask);
 
   // If there's matched write rules, we care about those more than read rules,
   // so shift them into place
@@ -905,6 +1077,23 @@ static __always_inline int match_and_enforce_path_hooks_read(
 
   // Get the path that's being accessed, and the executable accessing it
   char *path = prepend_path(f_path, BUFFER_ID_PATH);
+  if (path != NULL && is_path_external(f_path, task)) {
+    // For now, don't enforce file access on any paths outside of the container's namespace.
+    // Theoretically this means we can't protect any file accesses from escaping
+    // the container's namespace if that's possible, but so far I've noticed a
+    // lot of expected cross-namespace file accesses that we want to allow, but
+    // it's hard to figure out how to:
+    //
+    // * "sockfs" - can't determine a filename, shows up as external mount ns
+    // * "pipefs" - similar to sockfs
+    // * container image files - anytime the container accesses a file included
+    //   in the container's image that hasn't yet been modified, it shows up
+    //   first as a file access in the container's mount namespace (on the
+    //   overlay filesystem), and then as a second file access in another mount
+    //   namespace (on the host's filesystem)
+    return 0;
+  }
+
   char *source = get_task_source(task, BUFFER_ID_PATH);
 
   u32 alert_flags = 0;
@@ -925,7 +1114,7 @@ static __always_inline int match_and_enforce_path_hooks_read(
   bpf_probe_read(&mask, sizeof(mask), &mask);
 
   // Get the best matching rule for this event
-  u32 rule = match_with_info(inner, task, path, source, mask, true);
+  u32 rule = match_with_info(inner, task, path, source, mask);
 
   // If there's a matched ownerOnly rule, we care about it more, so shift it
   // into place

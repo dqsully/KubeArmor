@@ -687,6 +687,7 @@ var protocols = map[int32]string{
 	143: "Ethernet",
 	144: "AGGFRAG",
 	145: "NSH",
+	255: "raw",
 }
 
 // getProtocol Function

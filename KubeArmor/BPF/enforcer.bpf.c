@@ -30,6 +30,10 @@ int BPF_PROG(enforce_proc, struct linux_binprm *bprm, int ret) {
   // task's executable.
   struct path f_path = BPF_CORE_READ(bprm->file, f_path);
   char *path = prepend_path(&f_path, BUFFER_ID_PATH);
+  if (path != NULL && is_path_external(&f_path, task)) {
+    path = prepend_ext(BUFFER_ID_PATH);
+  }
+
   char *source = get_task_source(task, BUFFER_ID_PATH);
 
   u32 alert_flags = 0;
@@ -50,7 +54,7 @@ int BPF_PROG(enforce_proc, struct linux_binprm *bprm, int ret) {
   bpf_probe_read(&mask, sizeof(mask), &mask);
 
   // Get the best matching rule for this event
-  u32 rule = match_with_info(inner, task, path, source, mask, true);
+  u32 rule = match_with_info(inner, task, path, source, mask);
 
   // Shift the process parts of the rule into place
   rule >>= RULE_OFFSET_PROCESS_EXECUTE;
@@ -95,11 +99,21 @@ static __always_inline int match_net_policies(
   // Clear the path buffer
   clear_buffer(BUFFER_ID_PATH);
 
-  // Construct a 'path string' out of the socket type and protocol
+  // If the protocol is 0, try to guess it from the socket type
+  if (protocol == 0) {
+    if (socket_type == SOCK_STREAM) {
+      protocol = IPPROTO_TCP;
+    } else if (socket_type == SOCK_DGRAM) {
+      protocol = IPPROTO_UDP;
+    } else if (socket_type == SOCK_RAW) {
+      protocol = 0xFF;
+    }
+  }
+
+  // Construct a 'path string' out of the socket type
   struct network_rule_key path;
   path.rule_type = RULE_TYPE_NETWORK;
-  path.socket_type = socket_type; // socket_type will never be 0
-  path.protocol = protocol; // protocol may be 0, but there's only a null byte after this, so path is still a valid null-terminated string
+  path.protocol = protocol;
   path.null_byte = '\0';
 
   // Get the executable accessing the socket
@@ -108,7 +122,7 @@ static __always_inline int match_net_policies(
   u32 alert_flags = 0;
 
   // Get the best matching rule for this event
-  u32 rule = match_with_info(inner, task, path.raw, source, RULE_MASK, false);
+  u32 rule = match_net(inner, task, path.raw, source, RULE_MASK);
 
   // Apply the rule
   return apply_rule(

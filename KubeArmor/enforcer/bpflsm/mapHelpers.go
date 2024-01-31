@@ -36,10 +36,7 @@ func (be *BPFEnforcer) AddContainerIDToMap(containerID string, pidns, mntns uint
 	be.ContainerMapLock.Lock()
 	defer be.ContainerMapLock.Unlock()
 
-	var rules RuleList
-	rules.Init()
-
-	be.ContainerMap[containerID] = ContainerKV{Key: key, Rules: rules}
+	be.ContainerMap[containerID] = ContainerKV{Key: key, Rules: make(RuleList)}
 }
 
 // AddContainerIDToMap adds container metadata to Outer eBPF container Map for initialising enforcement tracking and initiates an InnerMap to store the container specific rules
@@ -83,7 +80,7 @@ func (be *BPFEnforcer) DeleteContainerInnerMap(containerID string) {
 		}
 		val := be.ContainerMap[containerID]
 		val.Map = nil
-		val.Rules.Init()
+		val.Rules = make(RuleList)
 		be.ContainerMap[containerID] = val
 	}
 }
@@ -101,11 +98,7 @@ func (be *BPFEnforcer) AddHostToMap() {
 		return
 	}
 
-	var rules RuleList
-
-	rules.Init()
-
-	be.ContainerMap["host"] = ContainerKV{Key: key, Map: im, Rules: rules}
+	be.ContainerMap["host"] = ContainerKV{Key: key, Map: im, Rules: make(RuleList)}
 	if err := be.BPFContainerMap.Put(key, im); err != nil {
 		be.Logger.Errf("error adding host to outer map: %s", err)
 	}

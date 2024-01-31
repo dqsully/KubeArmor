@@ -15,10 +15,10 @@ enum
     _FILE_RMDIR= 455,
     _FILE_SYMLINK = 456,
     _FILE_LINK = 457,
-    _FILE_RENAME = 8458,
+    _FILE_RENAME = 458,
     _FILE_CHMOD = 459,
     _FILE_TRUNCATE = 460,
- 
+
 
     // network
     _SOCKET_CREATE = 461,
@@ -27,7 +27,5 @@ enum
 
     //process
     _SECURITY_BPRM_CHECK = 352,
-
-
 };
 #endif /* __SYSCALLS_H */
