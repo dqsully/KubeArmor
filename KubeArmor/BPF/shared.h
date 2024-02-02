@@ -561,7 +561,7 @@ static __always_inline u32 init_event(
   return 0;
 }
 
-// match_dir() returns the best-matching directory rule (not pre-masked) for the
+// match_dir() returns the best-matching directory rule (pre-masked) for the
 // given path and mask, or RULE_NONE if no rule matched.
 //
 // The passed key must have a completely empty path field, since this will write
