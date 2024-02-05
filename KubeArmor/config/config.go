@@ -29,6 +29,7 @@ type KubearmorConfig struct {
 
 	Visibility     string // Container visibility to use
 	HostVisibility string // Host visibility to use
+	Monitor        bool   // Enable/Disable non-enforcement monitoring
 
 	Policy     bool // Enable/Disable policy enforcement
 	HostPolicy bool // Enable/Disable host policy enforcement
@@ -73,6 +74,7 @@ const (
 	ConfigNRIIndex                       string = "nriIndex"
 	ConfigVisibility                     string = "visibility"
 	ConfigHostVisibility                 string = "hostVisibility"
+	ConfigMonitor                        string = "monitor"
 	ConfigKubearmorPolicy                string = "enableKubeArmorPolicy"
 	ConfigKubearmorHostPolicy            string = "enableKubeArmorHostPolicy"
 	ConfigKubearmorVM                    string = "enableKubeArmorVm"
@@ -108,6 +110,7 @@ func readCmdLineParams() {
 
 	visStr := flag.String(ConfigVisibility, "process,file,network,capabilities", "Container Visibility to use [process,file,network,capabilities,none]")
 	hostVisStr := flag.String(ConfigHostVisibility, "default", "Host Visibility to use [process,file,network,capabilities,none] (default \"none\" for k8s, \"process,file,network,capabilities\" for VM)")
+	monitor := flag.Bool(ConfigMonitor, true, "Enable/Disable non-enforcement monitoring")
 
 	policyB := flag.Bool(ConfigKubearmorPolicy, true, "enabling KubeArmorPolicy")
 	hostPolicyB := flag.Bool(ConfigKubearmorHostPolicy, false, "enabling KubeArmorHostPolicy")
@@ -158,6 +161,7 @@ func readCmdLineParams() {
 
 	viper.SetDefault(ConfigVisibility, *visStr)
 	viper.SetDefault(ConfigHostVisibility, *hostVisStr)
+	viper.SetDefault(ConfigMonitor, *monitor)
 
 	viper.SetDefault(ConfigKubearmorPolicy, *policyB)
 	viper.SetDefault(ConfigKubearmorHostPolicy, *hostPolicyB)
@@ -236,6 +240,7 @@ func LoadConfig() error {
 
 	GlobalCfg.Visibility = viper.GetString(ConfigVisibility)
 	GlobalCfg.HostVisibility = viper.GetString(ConfigHostVisibility)
+	GlobalCfg.Monitor = viper.GetBool(ConfigMonitor)
 
 	GlobalCfg.Policy = viper.GetBool(ConfigKubearmorPolicy)
 	GlobalCfg.HostPolicy = viper.GetBool(ConfigKubearmorHostPolicy)
