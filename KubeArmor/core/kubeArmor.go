@@ -431,18 +431,18 @@ func KubeArmor() {
 
 	// Containerized workloads with Host
 	if cfg.GlobalCfg.Policy || cfg.GlobalCfg.HostPolicy {
+		// initialize system monitor
+		if !dm.InitSystemMonitor() {
+			dm.Logger.Err("Failed to initialize KubeArmor Monitor")
+
+			// destroy the daemon
+			dm.DestroyKubeArmorDaemon()
+
+			return
+		}
+		dm.Logger.Print("Initialized KubeArmor Monitor")
+
 		if cfg.GlobalCfg.Monitor {
-			// initialize system monitor
-			if !dm.InitSystemMonitor() {
-				dm.Logger.Err("Failed to initialize KubeArmor Monitor")
-
-				// destroy the daemon
-				dm.DestroyKubeArmorDaemon()
-
-				return
-			}
-			dm.Logger.Print("Initialized KubeArmor Monitor")
-
 			// monior system events
 			go dm.MonitorSystemEvents()
 			dm.Logger.Print("Started to monitor system events")

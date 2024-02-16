@@ -417,6 +417,15 @@ func (mon *SystemMonitor) UpdateVisibility() {
 
 // InitBPF Function
 func (mon *SystemMonitor) InitBPF() error {
+	err := mon.initBPFMaps()
+	if err != nil {
+		return err
+	}
+
+	if !cfg.GlobalCfg.Monitor {
+		return nil
+	}
+
 	homeDir, err := filepath.Abs(filepath.Dir(os.Args[0]))
 	if err != nil {
 		return err
@@ -446,10 +455,6 @@ func (mon *SystemMonitor) InitBPF() error {
 
 	bpfPath = bpfPath + "system_monitor.bpf.o"
 
-	err = mon.initBPFMaps()
-	if err != nil {
-		return err
-	}
 	mon.Logger.Printf("eBPF system monitor object file path: %s", bpfPath)
 	bpfModuleSpec, err := cle.LoadCollectionSpec(bpfPath)
 	if err != nil {
