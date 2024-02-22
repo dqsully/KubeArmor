@@ -616,22 +616,37 @@ func KubeArmor() {
 	// == //
 
 	if dm.K8sEnabled && cfg.GlobalCfg.Policy {
-		// watch k8s pods
-		go dm.WatchK8sPods()
-		dm.Logger.Print("Started to monitor Pod events")
+		var wg sync.WaitGroup
+		wg.Add(3)
 
 		// watch security policies
-		go dm.WatchSecurityPolicies()
-		dm.Logger.Print("Started to monitor security policies")
+		go func() {
+			dm.WatchSecurityPolicies()
+			wg.Done()
+			dm.Logger.Print("Monitoring security policies")
+		}()
 
 		// watch default posture
-		go dm.WatchDefaultPosture()
-		dm.Logger.Print("Started to monitor per-namespace default posture")
+		go func() {
+			dm.WatchDefaultPosture()
+			wg.Done()
+			dm.Logger.Print("Monitoring per-namespace default posture")
+		}()
 
 		// watch kubearmor configmap
-		go dm.WatchConfigMap()
-		dm.Logger.Print("Watching for posture changes")
+		go func() {
+			dm.WatchConfigMap()
+			wg.Done()
+			dm.Logger.Print("Watching for posture changes")
+		}()
 
+		// Wait for all watches to be fully synced before we start watching (and
+		// enforcing) pods
+		wg.Wait()
+
+		// watch k8s pods (function never returns, must be called in a goroutine)
+		go dm.WatchK8sPods()
+		dm.Logger.Print("Started to monitor Pod events")
 	}
 
 	if dm.K8sEnabled && cfg.GlobalCfg.HostPolicy {
