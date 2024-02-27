@@ -260,6 +260,7 @@ type Log struct {
 	// log
 	Type      string `json:"type"`
 	Source    string `json:"source"`
+	SourceExe string `json:"sourceExe"`
 	Operation string `json:"operation"`
 	Resource  string `json:"resource"`
 	Cwd       string `json:"cwd"`

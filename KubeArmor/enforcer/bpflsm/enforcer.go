@@ -300,8 +300,11 @@ func (be *BPFEnforcer) TraceEvents() {
 			continue
 		}
 
+		bpfSource, _, _ := bytes.Cut(event.Data.Source[:], []byte{0})
+		bpfPath, _, _ := bytes.Cut(event.Data.Path[:], []byte{0})
+
 		readLink := false
-		if len(string(bytes.Trim(event.Data.Source[:], "\x00"))) == 0 {
+		if len(string(bpfSource)) == 0 {
 			readLink = true
 		}
 		containerID := ""
@@ -322,11 +325,13 @@ func (be *BPFEnforcer) TraceEvents() {
 			},
 		}, readLink)
 
+		log.SourceExe = string(bpfSource)
+
 		switch event.EventID {
 
 		case mon.FileOpen, mon.FilePermission, mon.FileMknod, mon.FileMkdir, mon.FileRmdir, mon.FileUnlink, mon.FileSymlink, mon.FileLink, mon.FileRename, mon.FileChmod, mon.FileTruncate:
 			log.Operation = "File"
-			log.Resource = string(bytes.Trim(event.Data.Path[:], "\x00"))
+			log.Resource = string(bpfPath)
 			log.Data = "lsm=" + mon.GetSyscallName(int32(event.EventID))
 
 		case mon.SocketCreate, mon.SocketConnect, mon.SocketAccept:
@@ -344,8 +349,8 @@ func (be *BPFEnforcer) TraceEvents() {
 
 		case mon.SecurityBprmCheck:
 			log.Operation = "Process"
-			log.Source = string(bytes.Trim(event.Data.Source[:], "\x00"))
-			log.Resource = string(bytes.Trim(event.Data.Path[:], "\x00"))
+			log.Source = string(bpfSource)
+			log.Resource = string(bpfPath)
 			log.Data = "lsm=" + mon.GetSyscallName(int32(event.EventID))
 
 		case mon.Capable:
@@ -353,16 +358,19 @@ func (be *BPFEnforcer) TraceEvents() {
 			log.Resource = mon.Capabilities[int32(event.Data.Path[1])]
 			log.Data = "lsm=" + mon.GetSyscallName(int32(event.EventID)) + " " + log.Resource
 		}
+
 		// fallback logic if we don't receive source from BuildLogBase()
 		if len(log.Source) == 0 {
-			log.Source = string(bytes.Trim(event.Data.Source[:], "\x00"))
+			log.Source = string(bpfSource)
 			log.ProcessName = log.Source
 		}
+
 		if event.Retval >= 0 {
 			log.Result = "Passed"
 		} else {
 			log.Result = "Permission denied"
 		}
+
 		log.Enforcer = "BPFLSM"
 		be.Logger.PushLog(log)
 
