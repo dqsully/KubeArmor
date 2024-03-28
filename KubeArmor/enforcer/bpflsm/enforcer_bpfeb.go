@@ -12,12 +12,16 @@ import (
 	"github.com/cilium/ebpf"
 )
 
-type enforcerBufsK struct {
+type enforcerBuffer struct {
+	Data          [32760]int8
+	PrependOffset uint32
+	AppendOffset  uint32
+}
+
+type enforcerRuleKey struct {
 	Path   [256]int8
 	Source [256]int8
 }
-
-type enforcerBufsT struct{ Buf [32768]int8 }
 
 // loadEnforcer returns the embedded CollectionSpec for enforcer.
 func loadEnforcer() (*ebpf.CollectionSpec, error) {
@@ -73,11 +77,10 @@ type enforcerProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type enforcerMapSpecs struct {
-	Bufk                *ebpf.MapSpec `ebpf:"bufk"`
-	Bufs                *ebpf.MapSpec `ebpf:"bufs"`
-	BufsOff             *ebpf.MapSpec `ebpf:"bufs_off"`
+	Buffers             *ebpf.MapSpec `ebpf:"buffers"`
 	KubearmorContainers *ebpf.MapSpec `ebpf:"kubearmor_containers"`
 	KubearmorEvents     *ebpf.MapSpec `ebpf:"kubearmor_events"`
+	RuleKeys            *ebpf.MapSpec `ebpf:"rule_keys"`
 }
 
 // enforcerObjects contains all objects after they have been loaded into the kernel.
@@ -99,20 +102,18 @@ func (o *enforcerObjects) Close() error {
 //
 // It can be passed to loadEnforcerObjects or ebpf.CollectionSpec.LoadAndAssign.
 type enforcerMaps struct {
-	Bufk                *ebpf.Map `ebpf:"bufk"`
-	Bufs                *ebpf.Map `ebpf:"bufs"`
-	BufsOff             *ebpf.Map `ebpf:"bufs_off"`
+	Buffers             *ebpf.Map `ebpf:"buffers"`
 	KubearmorContainers *ebpf.Map `ebpf:"kubearmor_containers"`
 	KubearmorEvents     *ebpf.Map `ebpf:"kubearmor_events"`
+	RuleKeys            *ebpf.Map `ebpf:"rule_keys"`
 }
 
 func (m *enforcerMaps) Close() error {
 	return _EnforcerClose(
-		m.Bufk,
-		m.Bufs,
-		m.BufsOff,
+		m.Buffers,
 		m.KubearmorContainers,
 		m.KubearmorEvents,
+		m.RuleKeys,
 	)
 }
 

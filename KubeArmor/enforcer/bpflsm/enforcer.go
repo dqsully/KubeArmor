@@ -23,8 +23,8 @@ import (
 	tp "github.com/kubearmor/KubeArmor/KubeArmor/types"
 )
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang enforcer ../../BPF/enforcer.bpf.c -- -I/usr/include/ -O2 -g
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang enforcer_path ../../BPF/enforcer_path.bpf.c -- -I/usr/include/ -O2 -g
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang enforcer ../../BPF/enforcer.bpf.c -- -I/usr/include/ -O2 -g -mcpu=v3
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang enforcer_path ../../BPF/enforcer_path.bpf.c -- -I/usr/include/ -O2 -g -mcpu=v3
 
 // ===================== //
 // == BPFLSM Enforcer == //
@@ -75,7 +75,7 @@ func NewBPFEnforcer(node tp.Node, pinpath string, logger *fd.Feeder, monitor *mo
 	be.InnerMapSpec = &ebpf.MapSpec{
 		Type:       ebpf.Hash,
 		KeySize:    512,
-		ValueSize:  2,
+		ValueSize:  4,
 		MaxEntries: 256,
 	}
 
@@ -99,8 +99,13 @@ func NewBPFEnforcer(node tp.Node, pinpath string, logger *fd.Feeder, monitor *mo
 		Maps: ebpf.MapOptions{
 			PinPath: pinpath,
 		},
+		Programs: ebpf.ProgramOptions{
+			LogLevel: ebpf.LogLevelBranch | ebpf.LogLevelStats,
+			LogSize:  16 * 1024 * 1024,
+		},
 	}); err != nil {
 		be.Logger.Errf("error loading BPF LSM objects: %v", err)
+		be.Logger.Printf("%+v", errors.Unwrap(errors.Unwrap(err)))
 		return be, err
 	}
 
@@ -109,41 +114,49 @@ func NewBPFEnforcer(node tp.Node, pinpath string, logger *fd.Feeder, monitor *mo
 		be.Logger.Errf("opening lsm %s: %s", be.obj.EnforceProc.String(), err)
 		return be, err
 	}
+	be.Logger.Printf("EnforceProc stats: %s", be.obj.EnforceProc.VerifierLog)
 
 	be.Probes[be.obj.EnforceFile.String()], err = link.AttachLSM(link.LSMOptions{Program: be.obj.EnforceFile})
 	if err != nil {
 		be.Logger.Errf("opening lsm %s: %s", be.obj.EnforceFile.String(), err)
 		return be, err
 	}
+	be.Logger.Printf("EnforceFile stats: %s", be.obj.EnforceFile.VerifierLog)
 
 	be.Probes[be.obj.EnforceFilePerm.String()], err = link.AttachLSM(link.LSMOptions{Program: be.obj.EnforceFilePerm})
 	if err != nil {
 		be.Logger.Errf("opening lsm %s: %s", be.obj.EnforceFilePerm.String(), err)
 		return be, err
 	}
+	be.Logger.Printf("EnforceFilePerm stats: %s", be.obj.EnforceFilePerm.VerifierLog)
 
 	be.Probes[be.obj.EnforceNetCreate.String()], err = link.AttachLSM(link.LSMOptions{Program: be.obj.EnforceNetCreate})
 	if err != nil {
 		be.Logger.Errf("opening lsm %s: %s", be.obj.EnforceNetCreate.String(), err)
 		return be, err
 	}
+	be.Logger.Printf("EnforceNetCreate stats: %s", be.obj.EnforceNetCreate.VerifierLog)
 
 	be.Probes[be.obj.EnforceNetConnect.String()], err = link.AttachLSM(link.LSMOptions{Program: be.obj.EnforceNetConnect})
 	if err != nil {
 		be.Logger.Errf("opening lsm %s: %s", be.obj.EnforceNetConnect.String(), err)
 		return be, err
 	}
+	be.Logger.Printf("EnforceNetConnect stats: %s", be.obj.EnforceNetConnect.VerifierLog)
 
 	be.Probes[be.obj.EnforceNetAccept.String()], err = link.AttachLSM(link.LSMOptions{Program: be.obj.EnforceNetAccept})
 	if err != nil {
 		be.Logger.Errf("opening lsm %s: %s", be.obj.EnforceNetAccept.String(), err)
 		return be, err
 	}
+	be.Logger.Printf("EnforceNetAccept stats: %s", be.obj.EnforceNetAccept.VerifierLog)
+
 	be.Probes[be.obj.EnforceCap.String()], err = link.AttachLSM(link.LSMOptions{Program: be.obj.EnforceCap})
 	if err != nil {
 		be.Logger.Errf("opening lsm %s: %s", be.obj.EnforceCap.String(), err)
 		return be, err
 	}
+	be.Logger.Printf("EnforceCap stats: %s", be.obj.EnforceCap.VerifierLog)
 
 	/*
 		Path Hooks
@@ -159,6 +172,10 @@ func NewBPFEnforcer(node tp.Node, pinpath string, logger *fd.Feeder, monitor *mo
 		Maps: ebpf.MapOptions{
 			PinPath: common.GetMapRoot(),
 		},
+		Programs: ebpf.ProgramOptions{
+			LogLevel: ebpf.LogLevelBranch | ebpf.LogLevelStats,
+			LogSize:  16 * 1024 * 1024,
+		},
 	}); err != nil {
 		be.Logger.Warnf("error loading BPF LSM Path objects. This usually suggests that the system doesn't have the system has `CONFIG_SECURITY_PATH=y`: %v", err)
 	} else {
@@ -166,36 +183,43 @@ func NewBPFEnforcer(node tp.Node, pinpath string, logger *fd.Feeder, monitor *mo
 		if err != nil {
 			be.Logger.Warnf("opening lsm %s: %s", be.objPath.EnforceMknod.String(), err)
 		}
+		be.Logger.Printf("EnforceMknod stats: %s", be.objPath.EnforceMknod.VerifierLog)
 
 		be.Probes[be.objPath.EnforceLinkSrc.String()], err = link.AttachLSM(link.LSMOptions{Program: be.objPath.EnforceLinkSrc})
 		if err != nil {
 			be.Logger.Warnf("opening lsm %s: %s", be.objPath.EnforceLinkSrc.String(), err)
 		}
+		be.Logger.Printf("EnforceLinkSrc stats: %s", be.objPath.EnforceLinkSrc.VerifierLog)
 
 		be.Probes[be.objPath.EnforceLinkDst.String()], err = link.AttachLSM(link.LSMOptions{Program: be.objPath.EnforceLinkDst})
 		if err != nil {
 			be.Logger.Warnf("opening lsm %s: %s", be.objPath.EnforceLinkDst.String(), err)
 		}
+		be.Logger.Printf("EnforceLinkDst stats: %s", be.objPath.EnforceLinkDst.VerifierLog)
 
 		be.Probes[be.objPath.EnforceUnlink.String()], err = link.AttachLSM(link.LSMOptions{Program: be.objPath.EnforceUnlink})
 		if err != nil {
 			be.Logger.Warnf("opening lsm %s: %s", be.objPath.EnforceUnlink.String(), err)
 		}
+		be.Logger.Printf("EnforceUnlink stats: %s", be.objPath.EnforceUnlink.VerifierLog)
 
 		be.Probes[be.objPath.EnforceSymlink.String()], err = link.AttachLSM(link.LSMOptions{Program: be.objPath.EnforceSymlink})
 		if err != nil {
 			be.Logger.Warnf("opening lsm %s: %s", be.objPath.EnforceSymlink.String(), err)
 		}
+		be.Logger.Printf("EnforceSymlink stats: %s", be.objPath.EnforceSymlink.VerifierLog)
 
 		be.Probes[be.objPath.EnforceMkdir.String()], err = link.AttachLSM(link.LSMOptions{Program: be.objPath.EnforceMkdir})
 		if err != nil {
 			be.Logger.Warnf("opening lsm %s: %s", be.objPath.EnforceMkdir.String(), err)
 		}
+		be.Logger.Printf("EnforceMkdir stats: %s", be.objPath.EnforceMkdir.VerifierLog)
 
 		be.Probes[be.objPath.EnforceChmod.String()], err = link.AttachLSM(link.LSMOptions{Program: be.objPath.EnforceChmod})
 		if err != nil {
 			be.Logger.Warnf("opening lsm %s: %s", be.objPath.EnforceChmod.String(), err)
 		}
+		be.Logger.Printf("EnforceChmod stats: %s", be.objPath.EnforceChmod.VerifierLog)
 
 		// We do not support Chown for now because of limitations of bpf_trampoline https://github.com/iovisor/bcc/issues/3657
 		// be.Probes[be.objPath.EnforceChown.String()], err = link.AttachLSM(link.LSMOptions{Program: be.objPath.EnforceChown})
@@ -207,21 +231,25 @@ func NewBPFEnforcer(node tp.Node, pinpath string, logger *fd.Feeder, monitor *mo
 		if err != nil {
 			be.Logger.Warnf("opening lsm %s: %s", be.objPath.EnforceTruncate.String(), err)
 		}
+		be.Logger.Printf("EnforceTruncate stats: %s", be.objPath.EnforceTruncate.VerifierLog)
 
 		be.Probes[be.objPath.EnforceRenameNew.String()], err = link.AttachLSM(link.LSMOptions{Program: be.objPath.EnforceRenameNew})
 		if err != nil {
 			be.Logger.Warnf("opening lsm %s: %s", be.objPath.EnforceRenameNew.String(), err)
 		}
+		be.Logger.Printf("EnforceRenameNew stats: %s", be.objPath.EnforceRenameNew.VerifierLog)
 
 		be.Probes[be.objPath.EnforceRenameOld.String()], err = link.AttachLSM(link.LSMOptions{Program: be.objPath.EnforceRenameOld})
 		if err != nil {
 			be.Logger.Warnf("opening lsm %s: %s", be.objPath.EnforceRenameOld.String(), err)
 		}
+		be.Logger.Printf("EnforceRenameOld stats: %s", be.objPath.EnforceRenameOld.VerifierLog)
 
 		be.Probes[be.objPath.EnforceRmdir.String()], err = link.AttachLSM(link.LSMOptions{Program: be.objPath.EnforceRmdir})
 		if err != nil {
 			be.Logger.Warnf("opening lsm %s: %s", be.objPath.EnforceRmdir.String(), err)
 		}
+		be.Logger.Printf("EnforceRmdir stats: %s", be.objPath.EnforceRmdir.VerifierLog)
 	}
 
 	be.Events, err = ringbuf.NewReader(be.obj.KubearmorEvents)
